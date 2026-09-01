@@ -24,7 +24,7 @@ Three pieces:
   the broker revokes and shuts down.
 - **`agentdo`** (the shim) — a small client the process calls instead of `sudo`.
   It forwards the command to the broker over a Unix socket.
-- **`agentdo-launch.sh`** — starts the broker if needed, launches your client as
+- **`agentrun`** — starts the broker if needed, launches your client as
   your normal user with your environment, and registers it with the broker.
 
 The client runs as **your** user, so everything it writes is owned by you.
@@ -109,7 +109,7 @@ sudo chmod 0750 /opt/agentdo/agentdo-broker.py
 ## Use
 
 ```bash
-./agentdo-launch.sh <your-client-command> [args...]
+agentrun <your-client-command> [args...]
 ```
 
 The client comes up as your user with `/opt/agentdo/bin` early on its `PATH`, so

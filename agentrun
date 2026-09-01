@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
-# agentdo-launch.sh -- start a client process as your normal user, wired to the
-# agentdo broker so it can run privileged commands without being root.
+# agentrun -- start a client process as your normal user, wired to the agentdo
+# broker so it can run privileged commands without being root.
+#
+# Installed to a system PATH directory, so you can simply run:
+#     agentrun <cmd> [args...]
 #
 # What it does, in order:
 #   1. Ensures the agentdo broker daemon is running (starts it as root if not).
@@ -24,7 +27,7 @@
 # needed and (b) register the client. The client itself is NOT under sudo.
 #
 # Configure the values below (or override via env), then:
-#   ./agentdo-launch.sh <your-client-command> [args...]
+#   agentrun <your-client-command> [args...]
 
 set -euo pipefail
 
@@ -44,14 +47,14 @@ AGENTDO_BOOT_LOG="${AGENTDO_BOOT_LOG:-/var/log/agentdo.boot.log}"
 BROKER_PY="$INSTALL_DIR/agentdo-broker.py"
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <client-command> [args...]" >&2
+  echo "usage: agentrun <command> [args...]" >&2
   exit 2
 fi
 
 MY_UID="$(id -u)"
 
 if [[ "$MY_UID" == "0" ]]; then
-  echo "agentdo-launch.sh: run this as your NORMAL user, not root." >&2
+  echo "agentrun: run this as your NORMAL user, not root." >&2
   echo "It will invoke sudo itself where it needs to." >&2
   exit 1
 fi
