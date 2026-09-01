@@ -1,7 +1,11 @@
-# agentdo
+<p align="center">
+<img src="https://raw.githubusercontent.com/FlysonBot/agentdo/main/logo.svg" width="180" title="agentdo Logo" alt="agentdo Logo">
+</p>
 
-**Scoped, revocable root for Claude Code — one command at a time, gone the
-moment it exits.**
+<p align="center">
+<b>Scoped, revocable root for Claude Code — one command at a time,<br>
+gone the moment it exits.</b>
+</p>
 
 Imagine this:
 
