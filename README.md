@@ -193,7 +193,8 @@ Event kinds: `start`, `register`, `exec`, `done`, `deny`, `alert`, `reject`,
 
 ```bash
 python3 tests/run.py              # the whole suite
-python3 tests/run.py gate         # one module: gate | protocol | signals
+python3 tests/run.py gate         # one module:
+                                  #   gate | protocol | signals | launcher
 ```
 
 No dependencies and no sudo: the suite starts its own broker on a private
@@ -210,6 +211,9 @@ What each module covers:
   handshake, malformed requests, and the denylist.
 - **`test_signals.py`** — signal relay (Ctrl-C reaching the command, no orphan
   left behind) and resource hygiene (no descriptor leaks, concurrent commands).
+- **`test_launcher.py`** — `agentrun` itself: slow and failed sudo prompts,
+  startup timing, and argument checking. It substitutes a fake `sudo` early on
+  `PATH`, so the real one is never invoked and no password is ever requested.
 
 Most cases are regressions for bugs that reached a user; where that is so the
 test docstring names the failure it defends against, so a future change that

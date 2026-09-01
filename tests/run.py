@@ -2,13 +2,15 @@
 """Run the whole agentdo suite.
 
     python3 tests/run.py            # everything
-    python3 tests/run.py gate       # one module (gate | protocol | signals)
+    python3 tests/run.py gate       # one module
+                                    # (gate | protocol | signals | launcher)
 
 Runs entirely as your own user: the broker's root check lives in main(), and
 these tests drive the servers directly, so commands execute with your
-privileges rather than root's. Nothing here needs sudo and nothing touches
-/run, /var/log, or an installed copy -- each test gets its own broker on a
-private socket under /tmp.
+privileges rather than root's. The launcher tests substitute a fake `sudo` on
+PATH rather than invoking the real one. Nothing here needs sudo and nothing
+touches /run, /var/log, or an installed copy -- each test gets its own broker
+on a private socket under /tmp.
 """
 
 import os
@@ -16,7 +18,7 @@ import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODULES = ("test_gate", "test_protocol", "test_signals")
+MODULES = ("test_gate", "test_protocol", "test_signals", "test_launcher")
 
 
 def main():
