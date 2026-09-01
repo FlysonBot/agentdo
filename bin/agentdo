@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""
+agentdo  --  client shim that forwards a command to the agentdo broker.
+
+Deliberately NOT named `sudo`: it does not shadow the system sudo, and its name
+does not advertise a privilege path to anyone inspecting the environment.
+
+Usage:
+    agentdo <command> [args...]
+
+It connects to the broker's command socket, sends argv (plus cwd and a filtered
+env), and prints back stdout/stderr, exiting with the command's own exit code.
+If the broker denies the command, agentdo exits 126 with the reason on stderr so
+the caller sees a clear, non-crashing signal.
+"""
+
+import sys
+import os
+import socket
+import json
+
+SOCK_PATH = os.environ.get("AGENTDO_SOCK", "/run/agentdo.sock")
+
+# Environment variables forwarded to the privileged command. We do NOT forward
+# the whole environment blindly -- a poisoned env should not influence root
+# execution more than necessary. Extend deliberately if your workload needs it.
+ENV_FORWARD = ("PATH", "LANG", "LC_ALL", "TERM", "TZ")
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        sys.stderr.write("agentdo: no command given\n")
+        return 2
+
+    req = {
+        "argv": args,
+        "cwd": os.getcwd(),
+        "env": {k: os.environ[k] for k in ENV_FORWARD if k in os.environ},
+    }
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(SOCK_PATH)
+    except (FileNotFoundError, ConnectionRefusedError, PermissionError) as e:
+        sys.stderr.write(f"agentdo: cannot reach broker at {SOCK_PATH}: {e}\n")
+        return 127
+
+    buf = b""
+    try:
+        s.sendall(json.dumps(req).encode())
+        s.shutdown(socket.SHUT_WR)  # signal end-of-request; broker reads to EOF
+        while True:
+            b = s.recv(1 << 16)
+            if not b:
+                break
+            buf += b
+    except ConnectionResetError:
+        # The broker closed with our request still unread, so the kernel reset
+        # the connection and discarded whatever it had written back. Report it
+        # rather than surfacing a traceback; anything already received is
+        # parsed below, since a partial reply may still hold the reason.
+        if not buf:
+            sys.stderr.write(
+                "agentdo: connection reset by broker before it replied "
+                "(broker may have exited, or refused the request)\n")
+            return 127
+    except OSError as e:
+        sys.stderr.write(f"agentdo: broker connection failed: {e}\n")
+        return 127
+    finally:
+        s.close()
+
+    if not buf:
+        sys.stderr.write("agentdo: broker closed the connection without replying\n")
+        return 127
+
+    try:
+        resp = json.loads(buf)
+    except json.JSONDecodeError:
+        sys.stderr.write("agentdo: malformed response from broker\n")
+        return 127
+
+    if not resp.get("ok"):
+        sys.stderr.write("agentdo: " + resp.get("err", "unknown error") + "\n")
+        return 126 if resp.get("denied") else 127
+
+    return _emit(resp)
+
+def _emit(resp):
+    """Write the command's output, tolerating a closed downstream pipe.
+
+    `agentdo dmesg | head -1` closes the pipe as soon as head has its line, so
+    the write races the reader exiting. That is normal shell behaviour, not an
+    error: exit 141 (128 + SIGPIPE) the way a piped program conventionally
+    does, instead of surfacing a BrokenPipeError traceback.
+    """
+    try:
+        sys.stdout.write(resp.get("stdout", ""))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _silence_stdout()
+        return 141
+    try:
+        sys.stderr.write(resp.get("stderr", ""))
+        sys.stderr.flush()
+    except BrokenPipeError:
+        pass
+    return int(resp.get("code", 0))
+
+def _silence_stdout():
+    """Point stdout at /dev/null so the interpreter's shutdown flush cannot
+    re-raise the same BrokenPipeError after main() has already handled it."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except OSError:
+        pass
+
+if __name__ == "__main__":
+    sys.exit(main())

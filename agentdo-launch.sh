@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+#
+# agentdo-launch.sh -- start a client process as your normal user, wired to the
+# agentdo broker so it can run privileged commands without being root.
+#
+# What it does, in order:
+#   1. Ensures the agentdo broker daemon is running (starts it as root if not).
+#   2. Launches your client command as your normal user, with your real
+#      environment, and the agentdo shim early on its PATH.
+#   3. Registers the freshly-launched client PID with the broker (as root), so
+#      the broker authorizes exactly that process for its lifetime.
+#
+# WHY this shape:
+#   * The CLIENT runs as your normal user -> every file it writes (config,
+#     caches, data, anything in its working tree or your home) is owned by that
+#     user, not root. No root-owned droppings, no next-launch permission
+#     breakage, no cleanup step.
+#   * PRIVILEGE goes through the broker, which runs as root separately. The
+#     client never runs as root.
+#   * The broker is authorized to serve exactly this client PID, and the
+#     authorization dies when the client exits (pidfd-bound).
+#
+# You run this by hand. It uses sudo ONCE, up front, to (a) start the broker if
+# needed and (b) register the client. The client itself is NOT under sudo.
+#
+# Configure the values below (or override via env), then:
+#   ./agentdo-launch.sh <your-client-command> [args...]
+
+set -euo pipefail
+
+# ------------------------------- CONFIG ------------------------------------ #
+
+# Where you installed the broker and shim.
+INSTALL_DIR="${AGENTDO_INSTALL_DIR:-/opt/agentdo}"
+
+# Directory holding the `agentdo` shim, placed early on the client's PATH.
+SHIM_DIR="${AGENTDO_SHIM_DIR:-$INSTALL_DIR/bin}"
+
+# --------------------------------------------------------------------------- #
+
+AGENTDO_SOCK="${AGENTDO_SOCK:-/run/agentdo.sock}"
+AGENTDO_REG="${AGENTDO_REG:-/run/agentdo-reg.sock}"
+AGENTDO_BOOT_LOG="${AGENTDO_BOOT_LOG:-/var/log/agentdo.boot.log}"
+BROKER_PY="$INSTALL_DIR/agentdo-broker.py"
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <client-command> [args...]" >&2
+  exit 2
+fi
+
+MY_UID="$(id -u)"
+
+if [[ "$MY_UID" == "0" ]]; then
+  echo "agentdo-launch.sh: run this as your NORMAL user, not root." >&2
+  echo "It will invoke sudo itself where it needs to." >&2
+  exit 1
+fi
+
+# 1. Start the broker if its socket isn't there. -------------------------- #
+if [[ ! -S "$AGENTDO_SOCK" ]]; then
+  echo "[agentdo] broker not running; starting it (needs sudo once)..." >&2
+  # The redirect must happen INSIDE the privileged shell: if we wrote
+  # `sudo ... >/var/log/agentdo.boot.log`, our own (unprivileged) shell would
+  # try to open that file before sudo runs and fail with Permission denied.
+  # Wrapping in `sh -c '... > logfile'` makes root open the log. setsid
+  # detaches the broker so it keeps running after this launcher waits on the
+  # client.
+  sudo env \
+      AGENTDO_SOCK="$AGENTDO_SOCK" \
+      AGENTDO_REG="$AGENTDO_REG" \
+      AGENTDO_CLIENT_UID="$MY_UID" \
+      AGENTDO_BOOT_LOG="$AGENTDO_BOOT_LOG" \
+      setsid sh -c 'exec python3 "$0" >>"$AGENTDO_BOOT_LOG" 2>&1' "$BROKER_PY" &
+  for _ in $(seq 1 50); do
+    [[ -S "$AGENTDO_SOCK" ]] && break
+    sleep 0.1
+  done
+  if [[ ! -S "$AGENTDO_SOCK" ]]; then
+    echo "[agentdo] broker failed to start; see $AGENTDO_BOOT_LOG" >&2
+    exit 1
+  fi
+  echo "[agentdo] broker is up." >&2
+fi
+
+# 2. Register, then become the client IN THE FOREGROUND (with the terminal). #
+#
+#    Constraints being juggled:
+#      * The broker must register the client's PID while that PID is alive.
+#      * The client must NOT run before it's authorized (no early-run window).
+#      * The client must run in the FOREGROUND with the controlling terminal,
+#        or interactive clients (a shell) get EOF on stdin and exit instantly,
+#        and even non-interactive TUIs misbehave.
+#
+#    Design: the MAIN launcher process will `exec` into the client, so the
+#    client inherits this process's PID *and* its terminal (true foreground).
+#    We register our own PID with the broker FIRST (synchronously), then exec --
+#    same PID, same start-time, now authorized, holding the terminal. Because
+#    exec keeps the PID, the process the broker authorized is exactly the one
+#    that becomes your client. Registration is synchronous so a sudo password
+#    prompt (if any) appears cleanly before we hand the terminal to the client.
+
+SELF_PID=$$
+
+echo "[agentdo] registering client pid $SELF_PID with broker..." >&2
+
+# Register SELF_PID synchronously (foreground), so if sudo needs a password the
+# prompt appears cleanly on the terminal before we proceed. No FIFO/backgrounding
+# race. The registrar exits; it never becomes the client. We then exec into the
+# client with the SAME pid we just registered.
+REG_RESULT="$(sudo python3 - "$AGENTDO_REG" "$SELF_PID" <<'PY'
+import sys, socket, json
+reg_path, pid = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(reg_path)
+s.sendall(json.dumps({"pid": pid}).encode())
+s.shutdown(socket.SHUT_WR)
+print(s.recv(4096).decode())
+PY
+)"
+echo "[agentdo] broker says: $REG_RESULT" >&2
+
+if [[ "$REG_RESULT" != *'"ok":true'* ]]; then
+  echo "[agentdo] registration FAILED; not starting the client." >&2
+  exit 1
+fi
+
+echo "[agentdo] client (pid $SELF_PID) registered. Privilege dies when it exits." >&2
+
+# Become the client: same PID, same start-time, foreground with the terminal.
+# Whatever you passed ($@) replaces this process, inheriting the controlling
+# terminal, so `bash` gives you an interactive bash, `claude` gives you claude,
+# etc. The registered PID IS this process, so authorization follows it.
+exec env PATH="$SHIM_DIR:$PATH" "$@"

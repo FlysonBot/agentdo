@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy to /etc/agentdo/denylist.json and edit. Patterns are Python regexes matched against the space-joined argv. 'patterns' BLOCK; 'alert_patterns' LOG-AND-ALERT but still allow. Keep the block list short and high-confidence: a false positive is a wall your client hits mid-task. This file is hot-reloaded when it changes.",
+
+  "patterns": [
+    "\\brm\\b.*\\s-[a-z]*r[a-z]*f\\b.*\\s/(?:\\s|$)",
+    "\\bmkfs\\b",
+    "\\bdd\\b.*\\bof=/dev/(?:sd|nvme|vd|xvd)",
+    ">\\s*/etc/sudoers",
+    "\\btee\\b.*/etc/sudoers",
+    "\\buseradd\\b|\\badduser\\b",
+    "\\buserdel\\b|\\bdeluser\\b",
+    "\\bpasswd\\b\\s+\\w",
+    "\\bchpasswd\\b",
+    "\\bvisudo\\b",
+    ">\\s*/root/\\.ssh/authorized_keys",
+    "\\btee\\b.*/\\.ssh/authorized_keys",
+    "\\bufw\\b\\s+disable|\\bsystemctl\\b\\s+(?:stop|disable)\\s+(?:ufw|firewalld|nftables|iptables)",
+    "\\bsetenforce\\b\\s+0",
+    "\\biptables\\b\\s+-F\\b",
+    "\\bcurl\\b[^|]*\\|\\s*(?:sudo\\s+)?(?:ba)?sh\\b",
+    "\\bwget\\b[^|]*\\|\\s*(?:sudo\\s+)?(?:ba)?sh\\b"
+  ],
+
+  "alert_patterns": [
+    "\\bchown\\b",
+    "\\bchmod\\b\\s+[0-7]*7[0-7]{2}",
+    "\\bsystemctl\\b\\s+(?:start|enable)\\b",
+    "\\bcrontab\\b",
+    "\\bat\\b\\s",
+    "\\bnc\\b\\s|\\bncat\\b\\s",
+    "\\bchattr\\b",
+    "\\bmount\\b",
+    "\\bumount\\b"
+  ]
+}
