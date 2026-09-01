@@ -112,6 +112,30 @@ sudo install -m 0755 agentrun          /usr/local/bin/agentrun
 sudo install -m 0644 denylist.example.json /etc/agentdo/denylist.json
 ```
 
+To uninstall, remove what that put in place:
+
+```bash
+sudo pkill -f 'agentdo-broker[.]py'
+sudo rm -rf /opt/agentdo /etc/agentdo
+sudo rm -f  /usr/local/bin/agentrun /var/log/agentdo*.log /run/agentdo*.sock
+```
+
+### Scripted
+
+`install.sh` does the same thing in one command, and checks the platform,
+Python and kernel versions before it starts. `uninstall.sh` reverses it, keeping
+your deny list and logs unless you pass `--purge`.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/FlysonBot/agentdo/main/install.sh
+less install.sh && bash install.sh
+```
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/FlysonBot/agentdo/main/uninstall.sh
+less uninstall.sh && bash uninstall.sh
+```
+
 ## Use
 
 ```bash
@@ -130,8 +154,9 @@ For commands needing root, use `agentdo <cmd>` instead of `sudo <cmd>`.
 > only. Not the default, since a file named `sudo` on the `PATH` advertises the
 > privilege path.
 
-After upgrading, restart the broker — the running one keeps its old code in
-memory. (If you forget, `agentdo` says so rather than misbehaving.)
+Re-run the installer to upgrade; it restarts the broker for you, since a
+running one keeps its old code in memory. After a manual install, do that
+yourself — and if you forget, `agentdo` says so rather than misbehaving:
 
 ```bash
 sudo pkill -f 'agentdo-broker[.]py'
