@@ -1,49 +1,61 @@
 <p align="center">
-<img src="https://raw.githubusercontent.com/FlysonBot/agentdo/main/logo.svg" width="180" title="agentdo Logo" alt="agentdo Logo">
+<img src="https://raw.githubusercontent.com/FlysonBot/agentdo/main/logo.svg" width="260" title="agentdo Logo" alt="agentdo Logo">
 </p>
+
+<h3 align="center">Scoped, revocable root for Claude Code —<br>
+one command at a time, gone the moment it exits.</h3>
 
 <p align="center">
-<b>Scoped, revocable root for Claude Code — one command at a time,<br>
-gone the moment it exits.</b>
+<a href="#install"><img src="https://img.shields.io/badge/install-2%20minutes-d45840?style=flat-square" alt="Install in 2 minutes"></a>
+<img src="https://img.shields.io/badge/dependencies-none-d45840?style=flat-square" alt="No dependencies">
+<img src="https://img.shields.io/badge/python-3.9%2B-d45840?style=flat-square" alt="Python 3.9+">
+<img src="https://img.shields.io/badge/license-MIT-d45840?style=flat-square" alt="MIT License">
 </p>
 
-Imagine this:
+---
+
+## The problem
 
 You're debugging a service with Claude Code. It asks for `sudo journalctl -u nginx`.
 You run it. You paste the output back. It asks for `sudo systemctl status nginx`.
 You run it. You paste the output back. There's always one more command to run.
 
-You do this back and forth for an hour, when the agent could of done all
-of these for you in under 5 minutes.
+**You spend an hour relaying commands the agent could have run itself in five minutes.**
 
-The obvious fix is to let it run those commands itself. But an agent has no
-interactive terminal, so `sudo` cannot ask it for a password. That leaves
-three real options, and none are good:
+The obvious fix is to let it run those commands directly. But an agent has no
+interactive terminal, so `sudo` can never ask it for a password. That leaves
+three options, and none of them are good:
 
-- **Run the whole agent as root.** Every file it creates is now owned by root —
-  its config, its caches, the files in your project. You now need to fix permissions.
-  Claude may failed to launch next time due to permission issues. And there's
-  always one more file that slip through.
-- **Add `NOPASSWD:ALL` to sudoers.** Now *anything* running as your user have root,
-  not just the agent. A malware on your machine now have root for free.
-- **Setup an Askpass Program.** If you ever try to do this, you know how tedious
-  it is to get it to work, and you cannot bypass the issue that you now have
-  to store your sudo password somewhere on your disk since the program has to
-  enter them on your behave, which is terrible for security.
+| Option | What it costs you |
+| --- | --- |
+| **Run the agent as root** | Every file it creates is root-owned — its config, its caches, your project files. You'll be fixing permissions for days, and there's always one more that slipped through. |
+| **Add `NOPASSWD:ALL` to sudoers** | *Anything* running as your user now has root. Not just the agent. Malware on your machine gets root for free. |
+| **Set up an askpass program** | Tedious to wire up, and it only works if your sudo password sits somewhere a program can read it. Terrible trade. |
 
-Now, introducing `agentdo`!
+## The fix
 
-`agentdo` give you the fourth option, and it's a good one! With `agentdo`, a broker
-process run as root and execute commands on your AI agent's behaves. You launch your
-agent with `agentrun claude` (replace `claude` with your agent), and your agent now
-run `agentdo` instead of `sudo` whenever it need escalated permission. Your agent
-never run as root itself, so no file permission problem to fix. The broker is only
-thing that run as root, so nothing else need to be root, meaning no `NOPASSWD:ALL`
-needed. The broken request ask you to authenticate for `sudo` once at the beginning
-and keep running as root, so an askpass program is not needed either.
+`agentdo` is the fourth option.
 
-All the problem is solved! No password prompts. No root-owned files.
-No askpass program. And most importantly, it is secure!
+A **broker** process holds root and runs commands on your agent's behalf. You
+launch your agent with `agentrun claude`, and it calls `agentdo` instead of
+`sudo` whenever it needs privilege.
+
+```console
+$ agentrun claude                       # authenticate once, up front
+
+# ...inside the session, Claude runs privileged commands itself:
+$ dmesg | head -1
+dmesg: read kernel buffer failed: Operation not permitted
+$ agentdo dmesg | head -1
+[    0.000000] Linux version ...
+```
+
+Your agent never runs as root, so **nothing it writes ends up root-owned**. Only
+the broker is privileged, so **no `NOPASSWD:ALL`**. You authenticate once at
+launch and the broker keeps that privilege for the session, so **no askpass
+program and no password on disk**.
+
+When the agent exits, the privilege is gone.
 
 ---
 
@@ -57,34 +69,40 @@ Three pieces:
 | **`agentdo-broker.py`** | Runs as root. Checks every request, executes what it approves, logs everything. |
 | **`bin/agentdo`** | The shim your agent calls instead of `sudo`. |
 
-Four things keep this narrower than a sudoers entry:
+Four things keep this narrower than a sudoers entry.
 
-**Privilege is bound to one process, by the kernel.** At launch, the broker
-captures a `pidfd` for your agent — a kernel handle to that exact process, not a
-PID number that could later be reused by something else. Every request is
-checked against it, and the kernel reports who is calling via `SO_PEERCRED`, so
-the caller cannot lie about its identity. Requests from anywhere else on the
-machine are refused, even from your own user account, and even if they bypass
-the shim and speak the broker directly.
+### 🔒 Privilege is bound to one process, by the kernel
 
-**Privilege dies with the process.** The broker watches that `pidfd`. When your
-agent exits — cleanly, killed, or crashed — the broker revokes authorization and
-shuts itself down. There is no window afterward, and nothing to remember to undo.
-Close the terminal and the privilege is gone.
+At launch the broker captures a `pidfd` for your agent — a kernel handle to that
+exact process, not a PID number something else could later reuse. Every request
+is checked against it, and the kernel itself reports who is calling via
+`SO_PEERCRED`, so a caller cannot lie about its identity. Requests from anywhere
+else on the machine are refused — even from your own user account, and even if
+they skip the shim and speak to the broker directly.
 
-**Catastrophic commands are blocked outright.** A deny list refuses things a
-agent should never legitimately needs: reformatting a disk, creating
-users, rewriting `sudoers`, planting SSH keys, disabling the firewall,
-`curl | sh`. These are refused before the command runs, and the refusal is
-logged.
+### ⏱️ Privilege dies with the process
 
-**Everything is on the record.** Every command, every denial, every rejected
-caller is appended to a root-owned log the agent's own UID cannot rewrite. When
-you want to know what happened, there's an answer.
+The broker watches that `pidfd`. When your agent exits — cleanly, killed, or
+crashed — the broker revokes authorization and shuts itself down. There is no
+window afterward and nothing to remember to undo. Close the terminal and the
+privilege is gone.
 
-Commands run with your real terminal attached, so interactive tools work
-normally — `agentdo top` draws and responds to `Ctrl-C`, pipes and binary output
-behave, and there's no output size limit.
+### 🚫 Catastrophic commands are blocked outright
+
+A deny list refuses things an agent should never legitimately need:
+reformatting a disk, creating users, rewriting `sudoers`, planting SSH keys,
+disabling the firewall, `curl | sh`. These are rejected before the command runs,
+and the rejection is logged.
+
+### 📋 Everything is on the record
+
+Every command, every denial, and every rejected caller is appended to a
+root-owned log that the agent's own UID cannot rewrite. When you want to know
+what happened, there's an answer.
+
+> **Interactive commands work normally.** Your real terminal is attached, so
+> `agentdo top` draws and responds to `Ctrl-C`, pipes and binary output behave,
+> and there's no output size limit.
 
 ---
 
@@ -152,29 +170,32 @@ mismatch is refused with a message saying to restart.
 
 ---
 
-## Read this before you rely on it
+## ⚠️ Read this before you rely on it
 
-**What it protects against.** Unrelated processes cannot use the broker, even
-running as your user, even speaking the socket protocol directly. Privilege
-cannot outlive the client you launched. And every command is on the record in a
-log the client's own UID cannot rewrite.
+### ✅ What it protects against
 
-**What it does not.** Authorization answers *who is asking*, not *what they're
-asking for or why they're asking*. If your agent starts doing things you don't
-want it to do, or starts running malicious code, the broker cannot tell or
-stop it. There is a deny list feature, but it only blocks against a fixed
-list of dangerous patterns and is reactive, not proactive. If you noticed
-your agent is doing something you don't want it to do, you should interrupt
-it immediately before things get worse.
+Unrelated processes cannot use the broker — not even running as your user, not
+even speaking the socket protocol directly. Privilege cannot outlive the client
+you launched. And every command is on the record in a log the client's own UID
+cannot rewrite.
 
-**Prompt injection is the realistic threat.** An LLM agent takes instructions
-from whatever it reads: a web page, a repo, a log file, an error message. Text
-in any of those can tell it to run a command, and your agent might mistaken
-those as your instructions and run them. Treat every input your agent touches
-as capable of issuing commands with this privilege.
+### ❌ What it does not
 
-**The denylist is a guardrail, not a wall.** It blocks realistic accidents and
-unsophisticated misuse. It cannot stop someone who can shape arbitrary argv:
+Authorization answers *who is asking*, not *what they're asking for or why*. If
+your agent starts doing things you don't want, or starts running malicious code,
+the broker cannot tell and will not stop it. The deny list blocks a fixed set of
+dangerous patterns — it is reactive, not proactive. **If you notice your agent
+doing something you don't want, interrupt it immediately.**
+
+> [!WARNING]
+> **Prompt injection is the realistic threat.** An LLM agent takes instructions
+> from whatever it reads — a web page, a repo, a log file, an error message.
+> Text in any of those can tell it to run a command, and your agent may mistake
+> that for your instruction. Treat every input your agent touches as capable of
+> issuing commands with this privilege.
+
+**The deny list is a guardrail, not a wall.** It blocks realistic accidents and
+unsophisticated misuse. It cannot stop anyone who can shape arbitrary argv:
 `bash -c '<obfuscated>'` defeats string matching, by construction.
 
 ---
