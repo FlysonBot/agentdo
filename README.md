@@ -1,174 +1,215 @@
 # agentdo
 
-**Lifecycle-scoped privilege for a single process.**
+**Scoped, revocable root for Claude Code — one command at a time, gone the
+moment it exits.**
 
-`agentdo` lets one unprivileged process — typically an autonomous agent or a
-long-running application — run privileged commands, **without** running that
-process as root and **without** a blanket `NOPASSWD: ALL` sudoers entry. The
-grant is bound to one specific process instance and disappears the moment it
-exits.
+Imagine this:
 
-It exists for a specific situation: you have a process that legitimately needs
-to run many privileged commands, but you don't want to (a) run the whole process
-as root — which leaves root-owned files scattered through its config/working
-directories and breaks on the next launch — or (b) hand its user account
-permanent unrestricted sudo.
+You're debugging a service with Claude Code. It asks for `sudo journalctl -u nginx`.
+You run it. You paste the output back. It asks for `sudo systemctl status nginx`.
+You run it. You paste the output back. There's always one more command to run.
+
+You do this back and forth for an hour, when the agent could of done all
+of these for you in under 5 minutes.
+
+The obvious fix is to let it run those commands itself. But an agent has no
+interactive terminal, so `sudo` cannot ask it for a password. That leaves
+three real options, and none are good:
+
+- **Run the whole agent as root.** Every file it creates is now owned by root —
+  its config, its caches, the files in your project. You now need to fix permissions.
+  Claude may failed to launch next time due to permission issues. And there's
+  always one more file that slip through.
+- **Add `NOPASSWD:ALL` to sudoers.** Now *anything* running as your user have root,
+  not just the agent. A malware on your machine now have root for free.
+- **Setup an Askpass Program.** If you ever try to do this, you know how tedious
+  it is to get it to work, and you cannot bypass the issue that you now have
+  to store your sudo password somewhere on your disk since the program has to
+  enter them on your behave, which is terrible for security.
+
+Now, introducing `agentdo`!
+
+`agentdo` give you the fourth option, and it's a good one! With `agentdo`, a broker
+process run as root and execute commands on your AI agent's behaves. You launch your
+agent with `agentrun claude` (replace `claude` with your agent), and your agent now
+run `agentdo` instead of `sudo` whenever it need escalated permission. Your agent
+never run as root itself, so no file permission problem to fix. The broker is only
+thing that run as root, so nothing else need to be root, meaning no `NOPASSWD:ALL`
+needed. The broken request ask you to authenticate for `sudo` once at the beginning
+and keep running as root, so an askpass program is not needed either.
+
+All the problem is solved! No password prompts. No root-owned files.
+No askpass program. And most importantly, it is secure!
+
+---
 
 ## How it works
 
 Three pieces:
 
-- **`agentdo-broker.py`** — a daemon that runs as root. It authorizes exactly
-  one client process (captured as a `pidfd` at registration), executes commands
-  on its behalf, applies a denylist, and logs everything. When the client exits,
-  the broker revokes and shuts down.
-- **`agentdo`** (the shim) — a small client the process calls instead of `sudo`.
-  It forwards the command to the broker over a Unix socket.
-- **`agentrun`** — starts the broker if needed, launches your client as
-  your normal user with your environment, and registers it with the broker.
+| | |
+| --- | --- |
+| **`agentrun`** | Starts the broker, launches your agent as *you*, and registers it. |
+| **`agentdo-broker.py`** | Runs as root. Checks every request, executes what it approves, logs everything. |
+| **`bin/agentdo`** | The shim your agent calls instead of `sudo`. |
 
-The client runs as **your** user, so everything it writes is owned by you.
-Privileged commands are executed by the **root** broker on request. The two
-concerns are cleanly separated: the process that makes a mess is never root, and
-the thing that is root never wanders off writing files.
+Four things keep this narrower than a sudoers entry:
 
-### Authorization model
+**Privilege is bound to one process, by the kernel.** At launch, the broker
+captures a `pidfd` for your agent — a kernel handle to that exact process, not a
+PID number that could later be reused by something else. Every request is
+checked against it, and the kernel reports who is calling via `SO_PEERCRED`, so
+the caller cannot lie about its identity. Requests from anywhere else on the
+machine are refused, even from your own user account, and even if they bypass
+the shim and speak the broker directly.
 
-The broker authorizes a caller by:
+**Privilege dies with the process.** The broker watches that `pidfd`. When your
+agent exits — cleanly, killed, or crashed — the broker revokes authorization and
+shuts itself down. There is no window afterward, and nothing to remember to undo.
+Close the terminal and the privilege is gone.
 
-1. `SO_PEERCRED` on the Unix socket — the kernel stamps the connecting
-   process's real PID/UID, which the client cannot spoof.
-2. Matching that PID against the registered `pidfd` — a stable handle on one
-   process instance, so a **reused PID** after the client dies cannot inherit
-   the grant.
-3. A `/proc/<pid>/stat` start-time cross-check as a belt-and-suspenders guard
-   against PID reuse.
-4. A liveness check on the pidfd.
+**Catastrophic commands are blocked outright.** A deny list refuses things a
+agent should never legitimately needs: reformatting a disk, creating
+users, rewriting `sudoers`, planting SSH keys, disabling the firewall,
+`curl | sh`. These are refused before the command runs, and the refusal is
+logged.
 
-When the authorized process exits, the broker revokes immediately (it is woken
-by the pidfd, not a polling loop) and shuts itself down. **Privilege cannot
-outlive the process.**
+**Everything is on the record.** Every command, every denial, every rejected
+caller is appended to a root-owned log the agent's own UID cannot rewrite. When
+you want to know what happened, there's an answer.
 
-### Denylist, not allowlist
+Commands run with your real terminal attached, so interactive tools work
+normally — `agentdo top` draws and responds to `Ctrl-C`, pipes and binary output
+behave, and there's no output size limit.
 
-Workloads that need broad privilege (system auditing, troubleshooting,
-provisioning) routinely run general-purpose interpreters — `find -exec`,
-`bash -c`, `awk`, `python -c`. Any allowlist permissive enough to let such work
-proceed necessarily contains commands that are each an arbitrary-command escape
-hatch, so an allowlist gives you maintenance burden without a real boundary.
-
-`agentdo` instead:
-
-- **blocks** a short, editable list of catastrophic-and-rarely-needed operations
-  (see below),
-- **logs** every command to an append-only file the client's UID can't rewrite,
-- **alerts** (logs, does not block) on a configurable set of sensitive verbs.
-
-## Threat model — read before relying on this
-
-`agentdo` raises the bar for some attackers and is transparent to others. Be
-honest with yourself about which you face.
-
-- **Wandering foothold** (attacker enters via some *other* service, then hunts
-  for a way to escalate): the non-obvious shim + pidfd gate is a genuine
-  obstacle. They can't easily pose as the authorized client.
-- **Client compromise** (a malicious input to the agent, a poisoned dependency):
-  the hostile code runs **as the authorized client**, so the pidfd gate cannot
-  distinguish it from legitimate use. Here the **denylist and logs** are the only
-  in-band controls — and a string denylist can be evaded by anyone able to shape
-  arbitrary argv (`bash -c '<obfuscated>'`). The denylist targets realistic,
-  low-sophistication misuse ("add an SSH key", "create a user", "curl x | sh"),
-  not a determined human.
-- **Not a substitute for isolation.** For a host you can't afford to lose, run
-  the whole setup inside a VM or a snapshottable environment and point the
-  workload at that.
-
-In short: `agentdo` is a pragmatic middle point between "process runs as root"
-and "unrestricted passwordless sudo." It is not a security boundary against a
-motivated attacker who already controls the client.
+---
 
 ## Requirements
 
-- Linux with `pidfd_open` (kernel 5.3+; `os.pidfd_open` needs Python 3.9+, with a
-  raw-syscall fallback for older Python).
-- Python 3 (standard library only).
-- `sudo` available to start the broker and register the client once at launch.
+- Linux, kernel 5.3+ (for `pidfd_open`)
+- Python 3.9+ (standard library only — no dependencies)
+- `sudo`, used at launch to start the broker and register the agent
 
 ## Install
 
+First, clone this repo somewhere and `cd` into it:
+
+```bash
+git clone https://github.com/FlysonBot/agentdo.git
+cd agentdo
+```
+
+Then, install the broker and shim:
+
 ```bash
 sudo mkdir -p /opt/agentdo/bin /etc/agentdo
-sudo cp agentdo-broker.py /opt/agentdo/
-sudo cp bin/agentdo       /opt/agentdo/bin/
-sudo chmod 0755 /opt/agentdo/bin/agentdo
-sudo chmod 0750 /opt/agentdo/agentdo-broker.py
-# Optional: install a custom denylist (built-in defaults apply otherwise)
-# sudo cp denylist.example.json /etc/agentdo/denylist.json
+sudo install -m 0750 agentdo-broker.py /opt/agentdo/agentdo-broker.py
+sudo install -m 0755 bin/agentdo       /opt/agentdo/bin/agentdo
+sudo install -m 0755 agentrun          /usr/local/bin/agentrun
+
+# Optional — built-in defaults apply if you skip this:
+sudo install -m 0644 denylist.example.json /etc/agentdo/denylist.json
 ```
+
+`bin/` holds a single file on purpose: that directory is placed on the client's
+`PATH`, so anything in it becomes callable by name. Keeping the broker out of it
+is deliberate — don't flatten it.
 
 ## Use
 
 ```bash
-agentrun <your-client-command> [args...]
+agentrun claude          # or other agents and commands you want to grant this to
 ```
 
-The client comes up as your user with `/opt/agentdo/bin` early on its `PATH`, so
-it can call `agentdo <cmd>` wherever it would have called `sudo <cmd>`. When the
-client exits, the broker revokes and stops automatically.
+The client starts as you, with `/opt/agentdo/bin` **prepended** to its `PATH`.
+Anywhere it would have run `sudo <cmd>`, it runs `agentdo <cmd>` instead.
 
-### Wiring the client to use `agentdo`
+Claude Code won't know to do that on its own — tell it, in `CLAUDE.md`:
 
-Two options:
+```markdown
+For commands needing root, use `agentdo <cmd>` instead of `sudo <cmd>`.
+```
 
-1. **Explicit (recommended):** configure or instruct your client to run
-   privileged commands as `agentdo <cmd>` rather than `sudo <cmd>`. This keeps
-   the privilege path explicit and leaves the system `sudo` untouched.
-2. **Transparent:** place a wrapper named `sudo` in the shim directory that
-   forwards to `agentdo`. Existing `sudo ...` calls then route to the broker for
-   the client's `PATH` only; the system `/usr/bin/sudo` is unmodified. This is
-   not shipped by default because a file named `sudo` on the client's `PATH`
-   advertises the privilege path — but it's trivial to add if you want zero
-   changes to how the client phrases commands.
+If you'd rather not change how a client phrases commands, drop a wrapper named
+`sudo` into the shim directory that forwards to `agentdo`. This will shadow the
+system `sudo` for the agent's `PATH` only, leaving `/usr/bin/sudo` untouched.
+This isn't done by default as a file named `sudo` on the `PATH` advertises
+the privilege path to anything looking around.
+
+Upgrading? **Restart the broker by running the following** —
+the running one keeps its old code in memory:
+
+```bash
+sudo pkill -f 'agentdo-broker[.]py'
+```
+
+If you forget, `agentdo` tells you: requests carry a protocol version, and a
+mismatch is refused with a message saying to restart.
+
+---
+
+## Read this before you rely on it
+
+**What it protects against.** Unrelated processes cannot use the broker, even
+running as your user, even speaking the socket protocol directly. Privilege
+cannot outlive the client you launched. And every command is on the record in a
+log the client's own UID cannot rewrite.
+
+**What it does not.** Authorization answers *who is asking*, not *what they're
+asking for or why they're asking*. If your agent starts doing things you don't
+want it to do, or starts running malicious code, the broker cannot tell or
+stop it. There is a deny list feature, but it only blocks against a fixed
+list of dangerous patterns and is reactive, not proactive. If you noticed
+your agent is doing something you don't want it to do, you should interrupt
+it immediately before things get worse.
+
+**Prompt injection is the realistic threat.** An LLM agent takes instructions
+from whatever it reads: a web page, a repo, a log file, an error message. Text
+in any of those can tell it to run a command, and your agent might mistaken
+those as your instructions and run them. Treat every input your agent touches
+as capable of issuing commands with this privilege.
+
+**The denylist is a guardrail, not a wall.** It blocks realistic accidents and
+unsophisticated misuse. It cannot stop someone who can shape arbitrary argv:
+`bash -c '<obfuscated>'` defeats string matching, by construction.
+
+---
 
 ## Configuration
 
-All via environment variables:
+Everything is an environment variable:
 
 | Variable | Default | Meaning |
-|----------|---------|---------|
-| `AGENTDO_SOCK` | `/run/agentdo.sock` | Command socket path |
+| --- | --- | --- |
+| `AGENTDO_SOCK` | `/run/agentdo.sock` | Command socket |
 | `AGENTDO_REG` | `/run/agentdo-reg.sock` | Registration socket (root-only) |
 | `AGENTDO_LOG` | `/var/log/agentdo.log` | Append-only event log |
 | `AGENTDO_DENY` | `/etc/agentdo/denylist.json` | Denylist file (optional) |
-| `AGENTDO_CLIENT_UID` | `$SUDO_UID` | UID the broker will serve |
+| `AGENTDO_CLIENT_UID` | `$SUDO_UID` | UID the broker serves |
 | `AGENTDO_INSTALL_DIR` | `/opt/agentdo` | Where the files live |
-| `AGENTDO_SHIM_DIR` | `$INSTALL_DIR/bin` | Dir put early on client PATH |
+| `AGENTDO_SHIM_DIR` | `$INSTALL_DIR/bin` | Directory added to client `PATH` |
 
-## Denylist
+### Denylist
 
-Defaults are compiled into the broker and can be fully overridden by a JSON file
-at `AGENTDO_DENY`. Patterns are Python regexes matched against the space-joined
-argv; the file is hot-reloaded when it changes.
+Python regexes matched against the space-joined argv, hot-reloaded on change:
 
 ```json
 {
-  "patterns": ["...regexes that BLOCK the command..."],
-  "alert_patterns": ["...regexes that LOG-AND-ALERT but still allow..."]
+  "patterns":       ["...regexes that BLOCK the command..."],
+  "alert_patterns": ["...regexes that LOG but still ALLOW..."]
 }
 ```
 
-The built-in block list covers operations that are both dangerous and rarely
-legitimate for a read/inspect workload: recursive root deletion, filesystem
-formatting, `dd` onto a block device, user creation/deletion, password changes,
-`visudo`, rewriting `sudoers`, planting `authorized_keys`, disabling the
-firewall or SELinux, flushing iptables, and `curl|sh` / `wget|sh`. It alerts on
-`chown`, world-writable `chmod`, `systemctl start/enable`, `crontab`, `at`,
-`nc`, `chattr`, `mount`.
+Built-in blocks: recursive root deletion, `mkfs`, `dd` onto a block device, user
+creation/deletion, password changes, `visudo`, rewriting `sudoers`, planting
+`authorized_keys`, disabling the firewall or SELinux, flushing iptables, and
+`curl|sh` / `wget|sh`. Alerts on `chown`, world-writable `chmod`, `systemctl
+start/enable`, `crontab`, `at`, `nc`, `chattr`, `mount`.
 
-Keep the block list short and high-confidence: a false positive is a wall your
-client hits mid-task. See `denylist.example.json`.
+Keep your block list short and high-confidence. A false positive is a wall your
+agent hits mid-task. See `denylist.example.json`.
 
-## Logs
+### Logs
 
 One JSON object per line, fsync'd, append-only:
 
@@ -177,54 +218,26 @@ sudo tail -f /var/log/agentdo.log \
   | python3 -c 'import sys,json; [print(json.loads(l)) for l in sys.stdin]'
 ```
 
-Event kinds: `start`, `register`, `exec`, `done`, `deny`, `alert`, `reject`,
-`revoke`, `shutdown`.
+Events: `start`, `register`, `exec`, `done`, `deny`, `alert`, `reject`,
+`version_mismatch`, `revoke`, `shutdown`.
 
-## Verifying
-
-1. `agentdo cat /etc/shadow` from the client → returns content.
-2. `agentdo useradd -m test` → returns a denylist error, exits 126, logs `deny`.
-3. Kill the client → broker exits and the socket disappears.
-4. From a shell **outside** the launched process tree → connection rejected.
-   (Anything the launched client spawns is inside the tree and is served; the
-   gate keeps outsiders out, it does not police what the client itself runs.)
+---
 
 ## Tests
 
+50 tests, no dependencies and no `sudo` required:
+
 ```bash
-python3 tests/run.py              # the whole suite
-python3 tests/run.py gate         # one module:
-                                  #   gate | protocol | signals | launcher
+python3 tests/run.py
 ```
 
-No dependencies and no sudo: the suite starts its own broker on a private
-socket under `/tmp` and runs commands as **you**, not as root. It never touches
-`/run`, `/var/log`, or an installed copy, so it is safe to run on a machine
-where agentdo is live.
+See [TESTS.md](TESTS.md) for what they cover and a manual smoke-test checklist.
 
-What each module covers:
+## Status
 
-- **`test_gate.py`** — who may run commands: the ancestry walk (self, child,
-  grandchild, PID 1, a recycled PID, an orphan that escaped the tree) and the
-  same decisions end to end through the real client and socket.
-- **`test_protocol.py`** — stdio passing, exit-code conventions, the version
-  handshake, malformed requests, and the denylist.
-- **`test_signals.py`** — signal relay (Ctrl-C reaching the command, no orphan
-  left behind) and resource hygiene (no descriptor leaks, concurrent commands).
-- **`test_launcher.py`** — `agentrun` itself: slow and failed sudo prompts,
-  startup timing, and argument checking. It substitutes a fake `sudo` early on
-  `PATH`, so the real one is never invoked and no password is ever requested.
-
-Most cases are regressions for bugs that reached a user; where that is so the
-test docstring names the failure it defends against, so a future change that
-reintroduces one fails with an explanation rather than a bare assertion.
+Early and experimental. Read the code before running it as root on anything you
+care about.
 
 ## License
 
 MIT — see `LICENSE`.
-
-## Status
-
-Early / experimental. Review the code before running it as root on anything you
-care about, and treat the threat-model section above as load-bearing, not
-boilerplate.
