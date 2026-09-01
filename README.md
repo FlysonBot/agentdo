@@ -185,7 +185,35 @@ Event kinds: `start`, `register`, `exec`, `done`, `deny`, `alert`, `reject`,
 1. `agentdo cat /etc/shadow` from the client → returns content.
 2. `agentdo useradd -m test` → returns a denylist error, exits 126, logs `deny`.
 3. Kill the client → broker exits and the socket disappears.
-4. From another shell as the same user (different PID) → connection rejected.
+4. From a shell **outside** the launched process tree → connection rejected.
+   (Anything the launched client spawns is inside the tree and is served; the
+   gate keeps outsiders out, it does not police what the client itself runs.)
+
+## Tests
+
+```bash
+python3 tests/run.py              # the whole suite
+python3 tests/run.py gate         # one module: gate | protocol | signals
+```
+
+No dependencies and no sudo: the suite starts its own broker on a private
+socket under `/tmp` and runs commands as **you**, not as root. It never touches
+`/run`, `/var/log`, or an installed copy, so it is safe to run on a machine
+where agentdo is live.
+
+What each module covers:
+
+- **`test_gate.py`** — who may run commands: the ancestry walk (self, child,
+  grandchild, PID 1, a recycled PID, an orphan that escaped the tree) and the
+  same decisions end to end through the real client and socket.
+- **`test_protocol.py`** — stdio passing, exit-code conventions, the version
+  handshake, malformed requests, and the denylist.
+- **`test_signals.py`** — signal relay (Ctrl-C reaching the command, no orphan
+  left behind) and resource hygiene (no descriptor leaks, concurrent commands).
+
+Most cases are regressions for bugs that reached a user; where that is so the
+test docstring names the failure it defends against, so a future change that
+reintroduces one fails with an explanation rather than a bare assertion.
 
 ## License
 
