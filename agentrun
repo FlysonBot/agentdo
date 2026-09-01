@@ -68,14 +68,35 @@ if [[ ! -S "$AGENTDO_SOCK" ]]; then
   # Wrapping in `sh -c '... > logfile'` makes root open the log. setsid
   # detaches the broker so it keeps running after this launcher waits on the
   # client.
+  # Authenticate FIRST, in the foreground, with no timer running. Backgrounding
+  # the sudo that starts the broker meant the wait loop below began counting
+  # while sudo was still prompting: a user who took more than five seconds to
+  # type their password saw "broker failed to start", and a backgrounded sudo
+  # also has to fight the launcher for the terminal to prompt on. `sudo -v`
+  # just refreshes the credential cache, so the real invocation below finds it
+  # already valid and does not prompt again.
+  if ! sudo -v; then
+    echo "[agentdo] sudo authentication failed; not starting the broker." >&2
+    exit 1
+  fi
+
   sudo env \
       AGENTDO_SOCK="$AGENTDO_SOCK" \
       AGENTDO_REG="$AGENTDO_REG" \
       AGENTDO_CLIENT_UID="$MY_UID" \
       AGENTDO_BOOT_LOG="$AGENTDO_BOOT_LOG" \
       setsid sh -c 'exec python3 "$0" >>"$AGENTDO_BOOT_LOG" 2>&1' "$BROKER_PY" &
+  BROKER_SUDO=$!
+
+  # Now the wait is purely about process startup, not about typing speed.
   for _ in $(seq 1 50); do
     [[ -S "$AGENTDO_SOCK" ]] && break
+    # If the sudo wrapper exited without creating the socket, stop waiting out
+    # the full timeout and report it immediately.
+    if ! kill -0 "$BROKER_SUDO" 2>/dev/null; then
+      wait "$BROKER_SUDO" 2>/dev/null || true
+      break
+    fi
     sleep 0.1
   done
   if [[ ! -S "$AGENTDO_SOCK" ]]; then
