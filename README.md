@@ -28,9 +28,9 @@ three options, and none of them are good:
 
 | Option | What it costs you |
 | --- | --- |
-| Run the agent as **root** | Every file it creates is root-owned — its config, its caches, your project files. You'll be fixing permissions for days, and there's always one more that slipped through. |
-| Add `NOPASSWD:ALL` to **sudoers** | *Anything* running as your user now has root. Not just the agent. Malware on your machine gets root for free. |
-| Set up an **askpass** program | Tedious to wire up, and it only works if your sudo password sits somewhere a program can read it. Terrible trade. |
+| **Run the agent as root** | Every file it creates is root-owned — its config, its caches, your project files. You'll be fixing permissions for days, and there's always one more that slipped through. |
+| **Add `NOPASSWD:ALL` to sudoers** | *Anything* running as your user now has root. Not just the agent. Malware on your machine gets root for free. |
+| **Set up an askpass program** | Tedious to wire up, and it only works if your sudo password sits somewhere a program can read it. Terrible trade. |
 
 ## The fix
 
@@ -59,7 +59,7 @@ exits, the privilege is gone.
 
 Three pieces:
 
-| | |
+| Piece | What it does |
 | --- | --- |
 | **`agentrun`** | Starts the broker, launches your agent as *you*, and registers it. |
 | **`agentdo-broker.py`** | Runs as root. Checks every request, executes what it approves, logs everything. |
