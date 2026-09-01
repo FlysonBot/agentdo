@@ -82,6 +82,13 @@ CLIENT_UID  = int(os.environ.get("AGENTDO_CLIENT_UID",
 
 MAX_MSG     = 4 * 1024 * 1024  # 4 MiB cap on a single request payload
 
+# Wire-protocol version. Bump this whenever the request/reply shape changes.
+# The client sends the version it speaks; a mismatch is refused with a clear
+# message instead of silently misbehaving. A stale broker left running after an
+# upgrade previously swallowed all command output and exited 0 -- the worst
+# possible failure mode, and exactly what this check exists to prevent.
+PROTOCOL_VERSION = 2
+
 # ------------------------- pidfd / syscall plumbing ------------------------ #
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -322,21 +329,37 @@ def handle_client(conn):
             _send(conn, {"ok": False, "err": f"not authorized: {reason}"})
             return
 
-        raw = _recv_all(conn)
+        raw, fds = _recv_request(conn)
         if raw is None:
             _drain(conn)
             _send(conn, {"ok": False, "err": "oversized or malformed request"})
             return
         req = json.loads(raw)
+
+        client_ver = req.get("version")
+        if client_ver != PROTOCOL_VERSION:
+            log_event("version_mismatch", pid=pid, client=client_ver,
+                      broker=PROTOCOL_VERSION)
+            _close_fds(fds)
+            _send(conn, {"ok": False, "err":
+                         f"protocol mismatch: client speaks v{client_ver}, "
+                         f"broker speaks v{PROTOCOL_VERSION}. "
+                         f"Restart the broker so it picks up the installed version."})
+            return
+
         argv = req.get("argv")
         if not isinstance(argv, list) or not argv or \
            not all(isinstance(a, str) for a in argv):
+            _close_fds(fds)
             _send(conn, {"ok": False, "err": "argv must be a non-empty list of strings"})
             return
 
+        # Evaluated BEFORE the descriptors are attached to anything: a denied
+        # command must never get hold of the caller's stdin/stdout/stderr.
         decision, matched, alerts = evaluate(argv)
         if decision == "deny":
             log_event("deny", pid=pid, argv=argv, matched=matched)
+            _close_fds(fds)
             _send(conn, {"ok": False, "denied": True,
                          "err": f"blocked by denylist rule: {matched}"})
             return
@@ -344,27 +367,41 @@ def handle_client(conn):
         if alerts:
             log_event("alert", pid=pid, argv=argv, alerts=alerts)
 
+        if len(fds) != 3:
+            _close_fds(fds)
+            _send(conn, {"ok": False,
+                         "err": f"expected 3 file descriptors, got {len(fds)}"})
+            return
+
         log_event("exec", pid=pid, argv=argv)
         cwd = req.get("cwd") or None
         env = None
         if isinstance(req.get("env"), dict):
             env = {str(k): str(v) for k, v in req["env"].items()}
+
+        # The command inherits the CALLER's own stdin/stdout/stderr, so its I/O
+        # streams live to the caller's terminal or pipes and never passes
+        # through this process. No capture, no decode, no size cap -- and stdin
+        # works, which it cannot when output is buffered and returned as JSON.
         try:
-            proc = subprocess.run(argv, capture_output=True, cwd=cwd, env=env)
+            proc = _run_and_report_pid(conn, argv, fds, cwd, env)
+            # subprocess reports a signal death as a NEGATIVE returncode
+            # (-13 for SIGPIPE). Shells report 128+signal, and an exit status
+            # is only 8 bits, so passing -13 through would surface as 243.
+            # Normalise here, where the sign is still meaningful.
+            code = (128 - proc.returncode) if proc.returncode < 0 else proc.returncode
         except FileNotFoundError:
             _send(conn, {"ok": False, "err": f"command not found: {argv[0]}"})
             return
         except Exception as e:
             _send(conn, {"ok": False, "err": f"exec failed: {e}"})
             return
+        finally:
+            # Always release our copies; the caller holds its own originals.
+            _close_fds(fds)
 
-        log_event("done", pid=pid, argv0=argv[0], code=proc.returncode)
-        _send(conn, {
-            "ok": True,
-            "code": proc.returncode,
-            "stdout": proc.stdout.decode("utf-8", "replace"),
-            "stderr": proc.stderr.decode("utf-8", "replace"),
-        })
+        log_event("done", pid=pid, argv0=argv[0], code=code)
+        _send(conn, {"ok": True, "code": code})
     except Exception as e:
         try: _send(conn, {"ok": False, "err": f"broker error: {e}"})
         except OSError: pass
@@ -373,22 +410,102 @@ def handle_client(conn):
 
 # ------------------------------- helpers ----------------------------------- #
 
-def _recv_all(conn):
-    """Read a message up to MAX_MSG. The client sends the JSON then half-closes
-    its write side, so we read to EOF."""
-    chunks, total = [], 0
-    while True:
-        b = conn.recv(65536)
-        if not b:
-            break
-        total += len(b)
-        if total > MAX_MSG:
-            return None
-        chunks.append(b)
-    return b"".join(chunks)
+# The request is one datagram-shaped message carrying the JSON plus exactly
+# three SCM_RIGHTS descriptors (stdin, stdout, stderr). It is small and fixed in
+# shape, so it arrives in a single recv rather than being streamed to EOF: the
+# ancillary data rides with the first message and cannot be reassembled across
+# reads.
+MAX_REQUEST = 1 << 20  # 1 MiB is far beyond any argv/env; refuse anything larger
+EXPECTED_FDS = 3
+
+def _recv_request(conn):
+    """Return (payload_bytes, [fds]) or (None, []) if malformed/oversized.
+
+    Any descriptors received alongside a payload we then reject are closed by
+    the caller via _close_fds -- a leaked fd here would be a root-held handle on
+    the caller's terminal.
+    """
+    try:
+        msg, fds, _flags, _addr = socket.recv_fds(conn, MAX_REQUEST, EXPECTED_FDS)
+    except OSError:
+        return None, []
+    if not msg or len(msg) >= MAX_REQUEST:
+        _close_fds(fds)
+        return None, []
+    return msg, list(fds)
+
+# Signals the client is permitted to forward to a running command. Restricted
+# deliberately: the client may relay terminal-driven signals to the child it
+# asked for, but this is not a general "signal any process as root" primitive.
+FORWARDABLE_SIGNALS = {
+    signal.SIGINT, signal.SIGTERM, signal.SIGQUIT,
+    signal.SIGHUP, signal.SIGWINCH, signal.SIGTSTP, signal.SIGCONT,
+}
+
+def _run_and_report_pid(conn, argv, fds, cwd, env):
+    """Start the command, tell the client its PID, then relay signals to it.
+
+    The client sits between the terminal and the command, so terminal-generated
+    signals (Ctrl-C, window resize) are delivered to the CLIENT, not to the
+    command. Without relaying, Ctrl-C killed the shim and orphaned an
+    interactive program holding the terminal, and SIGWINCH never reached it so
+    resizes only took effect on the next redraw.
+
+    The client learns the child's PID from the "started" line below and sends
+    {"signal": N} lines while the command runs; each is forwarded to the child's
+    process group.
+    """
+    proc = subprocess.Popen(argv, stdin=fds[0], stdout=fds[1], stderr=fds[2],
+                            cwd=cwd, env=env, start_new_session=True)
+    try:
+        _send(conn, {"ok": True, "started": True, "pid": proc.pid})
+    except OSError:
+        proc.kill()
+        raise
+
+    stop = threading.Event()
+
+    def relay():
+        """Read {"signal": N} lines from the client until the command ends."""
+        f = conn.makefile("rb")
+        while not stop.is_set():
+            line = f.readline()
+            if not line:
+                break
+            try:
+                sig = int(json.loads(line).get("signal", 0))
+            except (ValueError, json.JSONDecodeError, AttributeError):
+                continue
+            if sig in (s.value for s in FORWARDABLE_SIGNALS):
+                try:
+                    # Signal the whole group: start_new_session put the command
+                    # in its own, so this cannot reach anything else.
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    break
+
+    t = threading.Thread(target=relay, daemon=True)
+    t.start()
+    proc.wait()
+    stop.set()
+    return proc
+
+def _close_fds(fds):
+    """Close our copies of received descriptors. Safe to call more than once
+    only if the list is cleared; callers pass each list exactly once."""
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 def _send(conn, obj):
-    conn.sendall(json.dumps(obj).encode())
+    """Send one newline-delimited JSON object.
+
+    The reply stream may carry more than one message (a "started" line, then
+    the final result), so each is newline-framed and the client reads by line.
+    """
+    conn.sendall((json.dumps(obj) + "\n").encode())
 
 def _drain(conn, limit=MAX_MSG):
     """Consume any unread request bytes, discarding them.

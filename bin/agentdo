@@ -8,8 +8,20 @@ does not advertise a privilege path to anyone inspecting the environment.
 Usage:
     agentdo <command> [args...]
 
-It connects to the broker's command socket, sends argv (plus cwd and a filtered
-env), and prints back stdout/stderr, exiting with the command's own exit code.
+It connects to the broker's command socket and sends argv (plus cwd and a
+filtered env) together with this process's own stdin, stdout and stderr, passed
+as file descriptors over SCM_RIGHTS. The privileged command inherits those
+descriptors directly, so its input and output stream live between your terminal
+and the command -- this shim never sees, buffers, or re-prints the data. Only
+the exit code comes back, and agentdo exits with it.
+
+Consequences of that design (all of them deliberate):
+  * stdin works: interactive and pipe-reading commands behave normally.
+  * Output is not size-capped and binary output is not UTF-8 mangled.
+  * Long-running commands stream progressively instead of appearing hung.
+  * SIGPIPE on `agentdo foo | head` is handled by the kernel against the real
+    command, not by this shim.
+
 If the broker denies the command, agentdo exits 126 with the reason on stderr so
 the caller sees a clear, non-crashing signal.
 """
@@ -18,8 +30,20 @@ import sys
 import os
 import socket
 import json
+import signal
 
 SOCK_PATH = os.environ.get("AGENTDO_SOCK", "/run/agentdo.sock")
+
+# Must match PROTOCOL_VERSION in agentdo-broker.py. A mismatch is reported
+# clearly rather than silently misbehaving.
+PROTOCOL_VERSION = 2
+
+# Terminal-driven signals we relay to the running command. The client is the
+# process the terminal signals, but the COMMAND is what should receive them.
+RELAY_SIGNALS = (
+    signal.SIGINT, signal.SIGTERM, signal.SIGQUIT,
+    signal.SIGHUP, signal.SIGWINCH, signal.SIGTSTP, signal.SIGCONT,
+)
 
 # Environment variables forwarded to the privileged command. We do NOT forward
 # the whole environment blindly -- a poisoned env should not influence root
@@ -33,6 +57,7 @@ def main():
         return 2
 
     req = {
+        "version": PROTOCOL_VERSION,
         "argv": args,
         "cwd": os.getcwd(),
         "env": {k: os.environ[k] for k in ENV_FORWARD if k in os.environ},
@@ -45,76 +70,137 @@ def main():
         sys.stderr.write(f"agentdo: cannot reach broker at {SOCK_PATH}: {e}\n")
         return 127
 
-    buf = b""
+    # Hand the broker our OWN stdin/stdout/stderr. The privileged command then
+    # writes straight to this terminal (or pipe) and reads straight from it:
+    # nothing is captured, buffered, re-encoded, or re-printed by us. That is
+    # what makes stdin work and what removes the size cap and the UTF-8
+    # mangling of binary output.
+    #
+    # The write side is NOT shut down after the request: the connection stays
+    # bidirectional so terminal signals can be relayed to the command while it
+    # runs (see _relay_signals).
     try:
-        s.sendall(json.dumps(req).encode())
-        s.shutdown(socket.SHUT_WR)  # signal end-of-request; broker reads to EOF
-        while True:
-            b = s.recv(1 << 16)
-            if not b:
-                break
-            buf += b
-    except ConnectionResetError:
-        # The broker closed with our request still unread, so the kernel reset
-        # the connection and discarded whatever it had written back. Report it
-        # rather than surfacing a traceback; anything already received is
-        # parsed below, since a partial reply may still hold the reason.
-        if not buf:
+        socket.send_fds(s, [json.dumps(req).encode()],
+                        [sys.stdin.fileno(), sys.stdout.fileno(),
+                         sys.stderr.fileno()])
+    except OSError as e:
+        sys.stderr.write(f"agentdo: broker connection failed: {e}\n")
+        s.close()
+        return 127
+
+    try:
+        return _converse(s)
+    finally:
+        s.close()
+
+def _converse(s):
+    """Read the broker's reply stream: an optional "started" line, then the
+    final result. While the command runs, relay terminal signals to it.
+
+    Handlers are installed BEFORE the first read: a Ctrl-C can land in the
+    window between sending the request and the command starting, and the
+    default SIGINT handler would raise KeyboardInterrupt out of readline --
+    killing this shim and orphaning a command that already holds the terminal.
+    Signals arriving that early are queued and flushed once the broker reports
+    the command has started.
+    """
+    f = s.makefile("rb")
+    restore = _relay_signals(s)
+    try:
+        first = f.readline()
+        if not first:
             sys.stderr.write(
-                "agentdo: connection reset by broker before it replied "
-                "(broker may have exited, or refused the request)\n")
+                "agentdo: broker closed the connection without replying\n")
             return 127
+        try:
+            resp = json.loads(first)
+        except json.JSONDecodeError:
+            sys.stderr.write("agentdo: malformed response from broker\n")
+            return 127
+
+        # A "started" line means the command is running and we should forward
+        # signals until the final result arrives.
+        if resp.get("started"):
+            _flush_pending(s)
+            line = f.readline()
+            if not line:
+                sys.stderr.write(
+                    "agentdo: broker closed the connection while the command "
+                    "was running\n")
+                return 127
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                sys.stderr.write("agentdo: malformed response from broker\n")
+                return 127
+    except ConnectionResetError:
+        sys.stderr.write(
+            "agentdo: connection reset by broker (it may have exited)\n")
+        return 127
     except OSError as e:
         sys.stderr.write(f"agentdo: broker connection failed: {e}\n")
         return 127
     finally:
-        s.close()
-
-    if not buf:
-        sys.stderr.write("agentdo: broker closed the connection without replying\n")
-        return 127
-
-    try:
-        resp = json.loads(buf)
-    except json.JSONDecodeError:
-        sys.stderr.write("agentdo: malformed response from broker\n")
-        return 127
+        if restore:
+            restore()
 
     if not resp.get("ok"):
         sys.stderr.write("agentdo: " + resp.get("err", "unknown error") + "\n")
         return 126 if resp.get("denied") else 127
 
-    return _emit(resp)
-
-def _emit(resp):
-    """Write the command's output, tolerating a closed downstream pipe.
-
-    `agentdo dmesg | head -1` closes the pipe as soon as head has its line, so
-    the write races the reader exiting. That is normal shell behaviour, not an
-    error: exit 141 (128 + SIGPIPE) the way a piped program conventionally
-    does, instead of surfacing a BrokenPipeError traceback.
-    """
-    try:
-        sys.stdout.write(resp.get("stdout", ""))
-        sys.stdout.flush()
-    except BrokenPipeError:
-        _silence_stdout()
-        return 141
-    try:
-        sys.stderr.write(resp.get("stderr", ""))
-        sys.stderr.flush()
-    except BrokenPipeError:
-        pass
+    # The command already wrote its own output; only its status comes back.
     return int(resp.get("code", 0))
 
-def _silence_stdout():
-    """Point stdout at /dev/null so the interpreter's shutdown flush cannot
-    re-raise the same BrokenPipeError after main() has already handled it."""
-    try:
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
-    except OSError:
-        pass
+# Signals that arrive before the broker confirms the command started are held
+# here, then flushed once it is safe to deliver them.
+_PENDING = {"armed": False, "queue": []}
+
+def _flush_pending(s):
+    """Deliver any signals caught before the command was running."""
+    _PENDING["armed"] = True
+    for sig in _PENDING["queue"]:
+        try:
+            s.sendall((json.dumps({"signal": sig}) + "\n").encode())
+        except OSError:
+            break
+    _PENDING["queue"].clear()
+
+def _relay_signals(s):
+    """Forward terminal signals to the running command; return an undo callable.
+
+    Ctrl-C and window resizes are delivered to THIS process, not to the command
+    that owns the terminal. Without this, Ctrl-C killed the shim -- leaving an
+    interactive program running with no parent -- and SIGWINCH never arrived,
+    so a resized window only reflowed on the command's next redraw.
+    """
+    previous = {}
+
+    def handler(signum, _frame):
+        # Never raise out of a signal handler here: an exception would unwind
+        # the socket read and abandon a running command. Deliver, or drop.
+        if _PENDING["armed"]:
+            try:
+                s.sendall((json.dumps({"signal": int(signum)}) + "\n").encode())
+            except OSError:
+                pass  # command already finished; nothing to signal
+        else:
+            _PENDING["queue"].append(int(signum))
+
+    for sig in RELAY_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, handler)
+        except (OSError, ValueError):
+            pass  # not settable on this platform; skip it
+
+    def restore():
+        _PENDING["armed"] = False
+        _PENDING["queue"].clear()
+        for sig, old in previous.items():
+            try:
+                signal.signal(sig, old)
+            except (OSError, ValueError):
+                pass
+    return restore
 
 if __name__ == "__main__":
     sys.exit(main())
