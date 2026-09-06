@@ -26,6 +26,13 @@ DESIGN (do not "simplify" these away):
     init or a subreaper such as `systemd --user`, leaving the tree, and then
     fails the ancestry check. Escaping the tree LOSES privilege: the gate fails
     closed.
+  * An upgrade HANDS OVER rather than restarting cold: a successor broker
+    adopts the running one's registry by receiving each live pidfd over
+    SCM_RIGHTS, and the predecessor retires once the transfer is confirmed.
+    Clients are registered only at launch, so killing a broker would strip
+    privilege from every running agent with no way back. Authorizations move as
+    descriptors and never as PID numbers -- re-deriving a pidfd from a
+    serialized PID would reopen the recycled-PID hole the pidfd design closes.
   * It does NOT allowlist commands. Many real workloads (e.g. system auditing,
     troubleshooting) legitimately run general-purpose interpreters
     (find/awk/bash -c/python -c), so an allowlist permissive enough to be
@@ -174,6 +181,20 @@ class State:
         with self.lock:
             return list(self.clients.values())
 
+    def adopt(self, client):
+        """Take on a client inherited from a predecessor broker.
+
+        Unlike add(), this never displaces a live entry: a client registered
+        directly with THIS broker is more current than anything the outgoing
+        one knew about, so the incoming copy is dropped instead. Returns True
+        if adopted, False if a live entry already covered that PID.
+        """
+        with self.lock:
+            if client.pid in self.clients:
+                return False
+            self.clients[client.pid] = client
+            return True
+
 
 state = State()
 
@@ -267,6 +288,277 @@ def evaluate(argv):
     hits = [rx.pattern for rx in alert if rx.search(joined)]
     return "allow", None, hits
 
+# ------------------------------- handoff ----------------------------------- #
+#
+# Upgrading used to sever privilege for every running client: the installer
+# killed the broker, and a client can only be registered at launch (agentrun
+# registers it in the exec handoff), so an already-running agent could never
+# get authorization back. It kept running, but every agentdo call failed.
+#
+# A successor broker therefore ADOPTS the registry from its predecessor. The
+# only sound way to move an authorization is to pass the live pidfd itself over
+# SCM_RIGHTS: a pidfd is a kernel handle to one exact process instance, and it
+# survives the transfer intact (the receiving broker can waitid on it and see
+# liveness, even after the sender closes its copy).
+#
+# What must NEVER happen here is re-deriving a pidfd from a serialized PID
+# number. That reintroduces exactly the recycled-PID attack the pidfd design
+# exists to prevent: between the old broker recording the number and the new
+# one re-opening it, the process can exit and an attacker can occupy the PID.
+# The start-time check narrows that window but does not close it, because the
+# attacker chooses when to fork. So PIDs on this wire are metadata only -- they
+# are cross-checked against the fd, never used to obtain authorization.
+#
+# The socket is root-only (0600 + peer-cred check), like the registration
+# socket: anything that can talk to it receives live authorizations.
+
+HANDOFF_PATH = os.environ.get("AGENTDO_HANDOFF", "/run/agentdo-handoff.sock")
+
+# The predecessor stops serving once it has handed over. Set when a successor
+# has taken the registry, so the outgoing broker fails closed rather than
+# racing its replacement.
+_handed_over = threading.Event()
+
+# Set while a handoff is in flight: from the moment the registry is snapshotted
+# for transfer until the handoff either completes or is abandoned.
+#
+# A client registering inside that window would be stranded: the successor was
+# told about the clients in the snapshot and no others, so a late arrival stays
+# only in the outgoing broker's registry and vanishes when it retires. The
+# window is short (a few tens of milliseconds), and the client would fail
+# closed rather than gain anything -- but it would fail *silently*, mid-launch.
+# Refusing to register during the window instead makes agentrun abort with a
+# clear message before it execs the client, which is recoverable: you just run
+# it again a moment later.
+_handoff_in_flight = threading.Event()
+
+# Listening sockets, so a broker can be stopped without exiting the process.
+# Production never needs this (a retiring broker calls os._exit), but the test
+# suite runs successive brokers in ONE process and must be able to stop the
+# accept loops of one it has retired.
+_listeners = []
+
+# The peer UID permitted to request a handoff. Root, always, in production: a
+# handoff hands out live authorizations. The test suite runs unprivileged and
+# relaxes this to its own UID, the same concession the registration socket
+# already makes (see tests/harness.py).
+HANDOFF_PEER_UID = 0
+
+# The peer UID permitted to register a client. Root, always, in production:
+# registration grants an authorization. Same test-suite concession as
+# HANDOFF_PEER_UID -- relaxed only by tests/harness.py, never in production.
+REG_PEER_UID = 0
+
+# How long each side waits on the other during a handoff. Generous: a transfer
+# is a handful of small messages, so reaching this means the peer is wedged or
+# gone, and the safe response is to abandon the handoff rather than wait.
+HANDOFF_TIMEOUT = 30.0
+
+def handoff_server():
+    """Serve the registry to a successor broker, then retire.
+
+    One shot: after a successful transfer this broker stops accepting commands
+    and exits. Two brokers must never serve the same socket concurrently --
+    they would have overlapping registries and racing _watch_exit threads.
+    """
+    _unlink_quiet(HANDOFF_PATH)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(HANDOFF_PATH)
+    _listeners.append(srv)
+    os.chmod(HANDOFF_PATH, 0o600)  # only root may ask for the registry
+    try:
+        srv.listen(2)
+    except OSError:
+        return  # stopped before we finished setting up
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return  # socket closed by stop_listening(); this broker is done
+        try:
+            _pid, uid, _gid = peer_creds(conn)
+            if uid != HANDOFF_PEER_UID:
+                _send(conn, {"ok": False, "err": "handoff requires root"})
+                continue
+            _serve_handoff(conn)
+        except Exception as e:
+            try: _send(conn, {"ok": False, "err": str(e)})
+            except OSError: pass
+        finally:
+            _close_gracefully(conn)
+
+def _serve_handoff(conn):
+    """Send every live client's pidfd to the successor, then retire.
+
+    Registration is blocked for the duration: a client that registered after
+    the snapshot below would not be in the transfer, and would be lost when
+    this broker retires. See _handoff_in_flight.
+    """
+    _handoff_in_flight.set()
+    try:
+        _do_handoff(conn)
+    finally:
+        # Cleared on every path, including an abandoned handoff: if we did not
+        # retire, we are still serving and must accept registrations again.
+        _handoff_in_flight.clear()
+
+def _do_handoff(conn):
+    clients = [c for c in state.snapshot()
+               if c.pidfd is not None and pidfd_alive(c.pidfd)]
+
+    # Sent as one message per client so each pidfd rides with the metadata
+    # describing it: a batched transfer would leave the receiver matching fds
+    # to records positionally, with no way to detect a mismatch.
+    _send(conn, {"ok": True, "count": len(clients),
+                 "version": PROTOCOL_VERSION})
+    for c in clients:
+        socket.send_fds(
+            conn, [(json.dumps({"pid": c.pid, "start": c.start}) + "\n").encode()],
+            [c.pidfd])
+
+    # Only retire once the successor confirms it has them all. If confirmation
+    # never arrives, this broker keeps serving -- a failed handoff must leave
+    # the clients with a working broker, not with neither.
+    conn.settimeout(HANDOFF_TIMEOUT)
+    try:
+        reply = json.loads(_read_line_unbuffered(conn) or b"{}")
+    except (OSError, socket.timeout, json.JSONDecodeError):
+        log_event("handoff_failed", reason="no confirmation from successor")
+        return
+    finally:
+        conn.settimeout(None)
+
+    if not reply.get("ok"):
+        log_event("handoff_failed", reason=reply.get("err", "successor refused"))
+        return
+
+    adopted = reply.get("adopted")
+    log_event("handoff_out", clients=len(clients), adopted=adopted)
+    _handed_over.set()
+    # The successor owns the sockets now; drop ours without unlinking the
+    # paths it has already bound, then exit. Routed through _retire so the
+    # tests, which run both brokers in one process, can stop at the state
+    # change instead of taking the whole test runner down with os._exit.
+    _retire()
+
+def _retire():
+    """Exit a broker that has handed its registry to a successor."""
+    os._exit(0)
+
+def stop_listening():
+    """Close this broker's listening sockets, ending its accept loops.
+
+    Not used in production, where a broker stops by exiting the process. The
+    test suite runs successive brokers in one process and needs a retired one
+    to actually stop accepting, rather than lingering and competing with its
+    successor for connections.
+    """
+    for srv in _listeners:
+        # shutdown() before close(): a thread already blocked inside accept()
+        # is not woken by closing the descriptor alone on Linux, so it would
+        # sit there forever holding the port. shutdown() forces accept() to
+        # return and the loop to see the error and exit.
+        try:
+            srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            srv.close()
+        except OSError:
+            pass
+    _listeners.clear()
+
+def adopt_from_predecessor(path=None):
+    """Take the registry from a running broker, if there is one.
+
+    Returns the number of clients adopted. Absent or unresponsive predecessor
+    is not an error: the successor simply starts empty, which is the old
+    behaviour.
+
+    `path` names the predecessor's handoff socket, defaulting to our own --
+    correct in production, where the predecessor exits and frees the path
+    before we bind it. The tests run both brokers in one process and pass the
+    predecessor's own path explicitly.
+    """
+    path = path or HANDOFF_PATH
+    if not os.path.exists(path):
+        return 0
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(HANDOFF_TIMEOUT)
+    try:
+        s.connect(path)
+    except (FileNotFoundError, ConnectionRefusedError, PermissionError, OSError):
+        return 0  # stale socket from a dead broker, or none listening
+    try:
+        return _receive_handoff(s)
+    except (OSError, socket.timeout, json.JSONDecodeError, ValueError) as e:
+        log_event("handoff_in_failed", err=str(e))
+        return 0
+    finally:
+        s.close()
+
+def _read_line_unbuffered(s):
+    """Read one newline-terminated message a byte at a time.
+
+    Deliberately not makefile().readline(): a buffered reader reads AHEAD, and
+    on a socket carrying SCM_RIGHTS that swallows the next message's bytes into
+    the buffer while its descriptors are dropped on the floor. Ancillary data
+    can only be collected by the recvmsg that reads its own payload, so every
+    read on this socket must consume exactly its own message and no more.
+    """
+    buf = bytearray()
+    while not buf.endswith(b"\n"):
+        b = s.recv(1)
+        if not b:
+            break
+        buf += b
+    return bytes(buf)
+
+def _receive_handoff(s):
+    header = json.loads(_read_line_unbuffered(s) or b"{}")
+    if not header.get("ok"):
+        log_event("handoff_in_failed", err=header.get("err", "predecessor refused"))
+        return 0
+    if header.get("version") != PROTOCOL_VERSION:
+        # Registry shape could differ across versions; refusing leaves the
+        # predecessor serving rather than adopting something misunderstood.
+        log_event("handoff_in_failed",
+                  err=f"version {header.get('version')} != {PROTOCOL_VERSION}")
+        return 0
+
+    adopted = 0
+    for _ in range(int(header.get("count", 0))):
+        msg, fds, _flags, _addr = socket.recv_fds(s, 65536, 1)
+        if not msg or not fds:
+            _close_fds(fds)
+            break
+        fd = fds[0]
+        try:
+            rec = json.loads(msg)
+            pid, start = int(rec["pid"]), rec["start"]
+        except (json.JSONDecodeError, KeyError, ValueError):
+            _close_fds([fd])
+            continue
+
+        # The fd is the authorization; the PID is only a label for it. Confirm
+        # they still describe the same live process before trusting the pair,
+        # so a mislabelled record cannot authorize the wrong tree.
+        if not pidfd_alive(fd) or _read_starttime(pid) != start:
+            log_event("handoff_dropped", client_pid=pid, reason="stale or mismatched")
+            _close_fds([fd])
+            continue
+
+        if state.adopt(Client(pid, fd, start)):
+            threading.Thread(target=_watch_exit, args=(fd, pid),
+                             daemon=True).start()
+            adopted += 1
+        else:
+            _close_fds([fd])
+
+    _send(s, {"ok": True, "adopted": adopted})
+    log_event("handoff_in", adopted=adopted)
+    return adopted
+
 # ---------------------------- registration --------------------------------- #
 
 def peer_creds(conn):
@@ -283,15 +575,31 @@ def registration_server():
     _unlink_quiet(REG_PATH)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(REG_PATH)
+    _listeners.append(srv)
     os.chmod(REG_PATH, 0o600)  # only root may register
-    srv.listen(4)
+    try:
+        srv.listen(4)
+    except OSError:
+        return  # stopped before we finished setting up
     while True:
-        conn, _ = srv.accept()
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return  # socket closed by stop_listening(); this broker is done
         try:
             pid, uid, gid = peer_creds(conn)
-            if uid != 0:
+            if uid != REG_PEER_UID:
                 conn.sendall(b'{"ok":false,"err":"registration requires root"}')
                 conn.close()
+                continue
+            # Refuse rather than strand: a registration accepted while a
+            # handoff is in flight would not reach the successor, and would
+            # disappear when this broker retires. agentrun reports this and
+            # exits without starting the client, so retrying works.
+            if _handoff_in_flight.is_set() or _handed_over.is_set():
+                log_event("register_refused", reason="handoff in progress")
+                conn.sendall(b'{"ok":false,"err":"broker is handing over to a '
+                             b'new version; retry in a moment"}')
                 continue
             msg = json.loads(conn.recv(65536))
             client_pid = int(msg["pid"])
@@ -331,6 +639,13 @@ def _watch_exit(pidfd, pid):
         os.close(pidfd)
     except OSError:
         pass
+    # A broker that handed its registry to a successor must stay silent here:
+    # the clients it was watching now belong to the successor, which runs its
+    # own watchers for them. Without this check the retired broker would log a
+    # revocation it no longer owns and, on the last one, call _shutdown() --
+    # tearing down a process whose sockets its successor has already taken.
+    if _handed_over.is_set():
+        return
     log_event("revoke", reason="client_exited", client_pid=pid,
               clients=remaining)
     if remaining == 0:
@@ -342,6 +657,7 @@ def command_server():
     _unlink_quiet(SOCK_PATH)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK_PATH)
+    _listeners.append(srv)
     # Only the client's uid (and root) can even open the socket. This is the
     # first gate; the peer-cred + pidfd checks below are the real ones.
     os.chmod(SOCK_PATH, 0o660)
@@ -350,9 +666,15 @@ def command_server():
             os.chown(SOCK_PATH, 0, CLIENT_UID)
         except OSError:
             pass
-    srv.listen(16)
+    try:
+        srv.listen(16)
+    except OSError:
+        return  # stopped before we finished setting up
     while True:
-        conn, _ = srv.accept()
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return  # socket closed by stop_listening(); this broker is done
         threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
 
 def _authorized_caller(conn):
@@ -364,6 +686,11 @@ def _authorized_caller(conn):
     rejection -- there is no cap on how many may be registered at once.
     """
     pid, uid, gid = peer_creds(conn)
+    # A broker that has handed its registry to a successor must not also serve
+    # commands: the successor now owns these authorizations, and two brokers
+    # acting on one registry would race each other.
+    if _handed_over.is_set():
+        return False, pid, "broker has retired; its successor now serves this socket"
     clients = state.snapshot()
     if not clients:
         return False, pid, "no authorized client registered"
@@ -675,8 +1002,13 @@ def _unlink_quiet(path):
 
 def _shutdown(*_):
     log_event("shutdown")
-    _unlink_quiet(SOCK_PATH)
-    _unlink_quiet(REG_PATH)
+    # A retired broker must not unlink the socket paths: its successor has
+    # already bound them, and removing them would strand every client with a
+    # missing socket. The successor owns those paths now.
+    if not _handed_over.is_set():
+        _unlink_quiet(SOCK_PATH)
+        _unlink_quiet(REG_PATH)
+        _unlink_quiet(HANDOFF_PATH)
     os._exit(0)
 
 # --------------------------------- main ------------------------------------ #
@@ -695,6 +1027,15 @@ def main():
 
     log_event("start", client_uid=CLIENT_UID, sock=SOCK_PATH)
 
+    # Adopt any running predecessor's clients BEFORE binding our own sockets:
+    # the outgoing broker only retires once the transfer is confirmed, so it
+    # keeps serving until we are ready to take over. A failed or absent handoff
+    # just leaves us empty, which is the pre-handoff behaviour.
+    adopted = adopt_from_predecessor()
+    if adopted:
+        log_event("adopted_clients", clients=adopted)
+
+    threading.Thread(target=handoff_server, daemon=True).start()
     threading.Thread(target=registration_server, daemon=True).start()
     command_server()
 
