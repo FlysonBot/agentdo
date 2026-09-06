@@ -19,6 +19,14 @@ installed copy, so the suite is safe to run while `agentdo` is live.
   handshake, malformed requests, the denylist.
 - **`test_signals.py`** — signal relay and resource hygiene.
 - **`test_launcher.py`** — `agentrun`: sudo prompts, startup timing, arguments.
+- **`test_handoff.py`** — upgrading without severing running clients: a
+  successor adopts its predecessor's registry as live pidfds, the predecessor
+  retires, and the gate is no wider afterwards. Also the failure branches,
+  driven by a peer that misbehaves on purpose: a non-root requester, a version
+  mismatch, and the three ways a handoff can be abandoned (the successor drops
+  the connection, stays silent until the timeout, or refuses outright). All
+  must leave the predecessor serving — a failed handoff must never leave
+  clients with no broker at all.
 
 Most cases are regressions for bugs that reached a user, and each says in its
 docstring which failure it defends against.

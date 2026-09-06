@@ -154,13 +154,28 @@ For commands needing root, use `agentdo <cmd>` instead of `sudo <cmd>`.
 > only. Not the default, since a file named `sudo` on the `PATH` advertises the
 > privilege path.
 
-Re-run the installer to upgrade; it restarts the broker for you, since a
-running one keeps its old code in memory. After a manual install, do that
-yourself — and if you forget, `agentdo` says so rather than misbehaving:
+Re-run the installer to upgrade. A running broker keeps its old code in memory,
+so the new version takes over from it: the outgoing broker passes each
+authorization to its successor as a live kernel handle, then retires. Agents
+that are mid-task keep working and never notice.
+
+> [!WARNING]
+> **Don't kill the broker to upgrade it.** A client is registered only at
+> launch, so killing the broker strips privilege from every running agent
+> *permanently* — they keep running, but every `agentdo` call fails until the
+> agent itself is restarted.
+
+After a manual install, start the new broker the same way and let it adopt:
 
 ```bash
-sudo pkill -f 'agentdo-broker[.]py'
+sudo env AGENTDO_CLIENT_UID="$(id -u)" \
+  setsid sh -c 'exec python3 /opt/agentdo/agentdo-broker.py \
+                >>/var/log/agentdo.boot.log 2>&1' &
 ```
+
+A broker installed before this feature has no handoff socket and cannot
+transfer its clients. Leave it running — it exits once its last client does,
+and the next `agentrun` starts the new version.
 
 ---
 
