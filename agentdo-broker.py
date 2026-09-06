@@ -114,12 +114,66 @@ def pidfd_alive(pidfd: int) -> bool:
 
 # ------------------------------ shared state ------------------------------- #
 
+class Client:
+    """One registered client: the root of an authorized process tree."""
+
+    __slots__ = ("pid", "pidfd", "start")
+
+    def __init__(self, pid, pidfd, start):
+        self.pid = pid
+        self.pidfd = pidfd
+        self.start = start      # /proc/<pid>/stat field 22, anti-recycle backup
+
+
 class State:
+    """Every currently-authorized client, keyed by PID.
+
+    MULTIPLE clients are authorized at once, deliberately. You may `agentrun`
+    as many processes as you like -- several agents, several terminals -- and
+    each gets its own independently-scoped authorization. An earlier version
+    kept a single slot here, so launching a second client silently revoked the
+    first one mid-task; see _watch_exit for the other half of that bug.
+
+    Keying by PID is safe because a live registration pins its PID: the kernel
+    cannot recycle a number while its process is alive, and a dead client is
+    reaped from the registry (dropping its key) before that number is free to
+    reuse. `start` is still checked per request as defence in depth.
+    """
+
     def __init__(self):
         self.lock = threading.Lock()
-        self.authorized_pid = None
-        self.authorized_pidfd = None
-        self.proc_start = None   # /proc/<pid>/stat field 22, anti-recycle backup
+        self.clients = {}        # pid -> Client
+
+    def add(self, client):
+        """Register a client, replacing any stale entry under the same PID."""
+        with self.lock:
+            old = self.clients.get(client.pid)
+            self.clients[client.pid] = client
+        # Close the superseded pidfd outside the lock; it refers to a process
+        # that already exited (see the keying note above), so its watcher is
+        # already on its way out.
+        if old is not None and old.pidfd != client.pidfd:
+            try:
+                os.close(old.pidfd)
+            except OSError:
+                pass
+
+    def remove(self, pid, pidfd):
+        """Drop a client. Returns the number of clients still registered.
+
+        The pidfd is matched as well as the PID so a watcher for a superseded
+        registration cannot evict the live one that replaced it.
+        """
+        with self.lock:
+            cur = self.clients.get(pid)
+            if cur is not None and cur.pidfd == pidfd:
+                del self.clients[pid]
+            return len(self.clients)
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.clients.values())
+
 
 state = State()
 
@@ -243,14 +297,10 @@ def registration_server():
             client_pid = int(msg["pid"])
             fd = pidfd_open(client_pid)
             start = _read_starttime(client_pid)
-            with state.lock:
-                if state.authorized_pidfd is not None:
-                    try: os.close(state.authorized_pidfd)
-                    except OSError: pass
-                state.authorized_pid   = client_pid
-                state.authorized_pidfd = fd
-                state.proc_start       = start
-            log_event("register", client_pid=client_pid, client_uid=CLIENT_UID)
+            # ADDITIVE: registering a second client does not disturb the first.
+            state.add(Client(client_pid, fd, start))
+            log_event("register", client_pid=client_pid, client_uid=CLIENT_UID,
+                      clients=len(state.snapshot()))
             threading.Thread(target=_watch_exit, args=(fd, client_pid),
                              daemon=True).start()
             conn.sendall(b'{"ok":true}')
@@ -261,18 +311,30 @@ def registration_server():
             conn.close()
 
 def _watch_exit(pidfd, pid):
-    """Block until the authorized process exits, then revoke instantly and
-    exit the whole broker. Privilege cannot outlive the client."""
+    """Block until this authorized process exits, then revoke ITS authorization.
+
+    Revocation is per-client: one client exiting must not disturb the others.
+    An earlier version shut the whole broker down here, so the first `agentrun`
+    to finish tore down privilege for every other one still working.
+
+    The broker exits only when the LAST client is gone, which keeps the
+    original guarantee -- privilege never outlives the processes it was granted
+    to -- while allowing any number of them to coexist.
+    """
     try:
         os.waitid(os.P_PIDFD, pidfd, os.WEXITED)
     except (ChildProcessError, OSError):
         import select
         select.select([pidfd], [], [])
-    with state.lock:
-        if state.authorized_pid == pid:
-            state.authorized_pid = None
-    log_event("revoke", reason="client_exited", client_pid=pid)
-    _shutdown()
+    remaining = state.remove(pid, pidfd)
+    try:
+        os.close(pidfd)
+    except OSError:
+        pass
+    log_event("revoke", reason="client_exited", client_pid=pid,
+              clients=remaining)
+    if remaining == 0:
+        _shutdown()
 
 # ---------------------------- command serving ------------------------------ #
 
@@ -294,28 +356,34 @@ def command_server():
         threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
 
 def _authorized_caller(conn):
-    """The core gate. Returns (ok, pid, reason)."""
+    """The core gate. Returns (ok, pid, reason).
+
+    A caller is authorized if it belongs to ANY registered client's tree. The
+    trees are independent: each `agentrun` contributes one, and a caller needs
+    to match exactly one of them. Being outside all of them is the only
+    rejection -- there is no cap on how many may be registered at once.
+    """
     pid, uid, gid = peer_creds(conn)
-    with state.lock:
-        apid   = state.authorized_pid
-        afd    = state.authorized_pidfd
-        astart = state.proc_start
-    if apid is None:
+    clients = state.snapshot()
+    if not clients:
         return False, pid, "no authorized client registered"
     if uid != CLIENT_UID:
         return False, pid, f"uid {uid} != client uid {CLIENT_UID}"
-    # Liveness of the registered root is checked BEFORE ancestry: if the root
-    # is gone the tree is void, whatever /proc still shows mid-teardown.
-    if afd is not None and not pidfd_alive(afd):
-        return False, pid, "authorized client no longer alive"
-    # The caller is the registered process itself, or something below it in the
-    # process tree. The tree -- not a single PID -- is the unit of authorization,
-    # because the shim runs as a CHILD of the registered client, never as the
-    # client's own PID. _is_descendant_of re-checks the root's start-time, so a
-    # recycled PID cannot inherit authorization.
-    if not _is_descendant_of(pid, apid, astart):
-        return False, pid, f"pid {pid} is not {apid} or a descendant of it"
-    return True, pid, None
+    for c in clients:
+        # Liveness of the registered root is checked BEFORE ancestry: if the
+        # root is gone the tree is void, whatever /proc still shows mid-teardown.
+        if c.pidfd is not None and not pidfd_alive(c.pidfd):
+            continue
+        # The caller is a registered process itself, or something below it in
+        # the process tree. The tree -- not a single PID -- is the unit of
+        # authorization, because the shim runs as a CHILD of the registered
+        # client, never as the client's own PID. _is_descendant_of re-checks
+        # the root's start-time, so a recycled PID cannot inherit authorization.
+        if _is_descendant_of(pid, c.pid, c.start):
+            return True, pid, None
+    roots = ", ".join(str(c.pid) for c in clients)
+    return False, pid, (f"pid {pid} is not within any authorized client tree "
+                        f"(roots: {roots})")
 
 def handle_client(conn):
     try:
@@ -626,6 +694,7 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
 
     log_event("start", client_uid=CLIENT_UID, sock=SOCK_PATH)
+
     threading.Thread(target=registration_server, daemon=True).start()
     command_server()
 
