@@ -97,32 +97,77 @@ fi
 # with no way back short of restarting the agent. Instead start the new broker
 # and let it ADOPT the old one's clients over the handoff socket; the old one
 # retires once the transfer is confirmed, and agents mid-task never notice.
-if pgrep -f "$INSTALL_DIR/agentdo-broker.py" >/dev/null 2>&1; then
+# Broker PIDs, excluding this script and its own children. A bare
+# `pgrep -f "<pattern>"` also matches any process whose ARGUMENTS contain the
+# pattern -- including the pgrep in a command substitution here -- which
+# inflates the count and can make a completed handoff look like two brokers.
+# Matching /proc/<pid>/exe's argv[1] avoids the whole class of self-matching.
+broker_pids() {
+  local pid comm
+  for pid in $(pgrep -x python3 2>/dev/null); do
+    [[ "$pid" == "$$" ]] && continue
+    comm="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 2p)"
+    [[ "$comm" == "$INSTALL_DIR/agentdo-broker.py" ]] && printf '%s\n' "$pid"
+  done
+}
+
+if [[ -n "$(broker_pids)" ]]; then
   SOCK="${AGENTDO_SOCK:-/run/agentdo.sock}"
+  REG="${AGENTDO_REG:-/run/agentdo-reg.sock}"
   HANDOFF="${AGENTDO_HANDOFF:-/run/agentdo-handoff.sock}"
   BOOT_LOG="${AGENTDO_BOOT_LOG:-/var/log/agentdo.boot.log}"
 
   if [[ -S "$HANDOFF" ]]; then
     say "a broker is running; handing its clients to the new version..."
+    OLD_PIDS="$(broker_pids | sort -n | tr '\n' ' ')"
+
     # The successor must serve the same user, so take the client UID from the
     # broker it is replacing rather than assuming it is whoever runs this.
-    OLD_PID="$(pgrep -f "$INSTALL_DIR/agentdo-broker.py" | head -1)"
-    OLD_UID="$(sudo tr '\0' '\n' < "/proc/$OLD_PID/environ" 2>/dev/null \
-               | sed -n 's/^AGENTDO_CLIENT_UID=//p' | head -1)"
+    #
+    # `sudo cat`, not `sudo tr < file`: with a redirect, OUR shell opens the
+    # file before sudo ever runs, and an unprivileged shell cannot read root's
+    # /proc/<pid>/environ. The read itself has to happen as root. (agentrun
+    # documents the same trap for its log redirect.)
+    OLD_UID=""
+    for p in $OLD_PIDS; do
+      OLD_UID="$(sudo cat "/proc/$p/environ" 2>/dev/null | tr '\0' '\n' \
+                 | sed -n 's/^AGENTDO_CLIENT_UID=//p' | head -1)"
+      [[ -n "$OLD_UID" ]] && break
+    done
 
     if [[ -n "$OLD_UID" ]]; then
+      # Pass the socket paths through explicitly. `sudo env FOO=bar` forwards
+      # ONLY what is listed, so a successor started without these would fall
+      # back to the built-in defaults and bind paths the predecessor is not
+      # using -- serving an empty registry on the default socket while the real
+      # broker keeps its clients on the configured one.
       sudo env AGENTDO_CLIENT_UID="$OLD_UID" \
+               AGENTDO_SOCK="$SOCK" AGENTDO_REG="$REG" \
+               AGENTDO_HANDOFF="$HANDOFF" \
         setsid sh -c "exec python3 '$INSTALL_DIR/agentdo-broker.py' \
                       >>'$BOOT_LOG' 2>&1" &
+
+      # The predecessor exits only after the successor confirms the transfer,
+      # so "every original PID is gone" is the signal that the handoff really
+      # completed rather than merely started.
       for _ in $(seq 1 50); do
         sleep 0.1
-        [[ -S "$SOCK" ]] && ! kill -0 "$OLD_PID" 2>/dev/null && break
+        STILL_OLD=""
+        for p in $OLD_PIDS; do
+          kill -0 "$p" 2>/dev/null && STILL_OLD="yes"
+        done
+        [[ -z "$STILL_OLD" && -S "$SOCK" ]] && break
       done
-      if kill -0 "$OLD_PID" 2>/dev/null; then
-        say "the old broker did not retire; it is still serving its clients."
-        say "they are unaffected -- it will exit when its last client does."
-      else
+
+      if [[ -z "$STILL_OLD" && -S "$SOCK" && -n "$(broker_pids)" ]]; then
         say "upgrade complete; running agents kept their authorization."
+      elif [[ -n "$STILL_OLD" ]]; then
+        say "the old broker did not retire; it is still serving its clients."
+        say "they are unaffected -- it will exit when its last client does,"
+        say "and the next 'agentrun' starts the new version."
+      else
+        say "the new broker did not come up; see $BOOT_LOG."
+        say "no broker is serving now -- run 'agentrun' to start the new one."
       fi
     else
       say "could not read the running broker's client UID; leaving it alone."
