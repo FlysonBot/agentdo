@@ -19,6 +19,7 @@ Two constraints shape everything here:
 """
 
 import importlib.util
+import itertools
 import json
 import os
 import shutil
@@ -35,6 +36,8 @@ BROKER_SRC = os.path.join(REPO, "agentdo-broker.py")
 CLIENT = os.path.join(REPO, "bin", "agentdo")
 
 
+_handoff_seq = itertools.count()
+
 
 def load_broker(sock_dir, deny_path=None):
     """Import agentdo-broker.py as a module with test paths in the environment.
@@ -42,6 +45,12 @@ def load_broker(sock_dir, deny_path=None):
     The module reads its configuration at import time, so the environment must
     be set before the import, and each test gets its own freshly-imported copy
     to avoid sharing broker state between tests.
+
+    Each instance gets its OWN handoff socket path. In production a successor
+    reuses the path because the predecessor has exited and freed it, but these
+    tests run both brokers in one process, where a retired broker's accept loop
+    is still alive; sharing the path would make them contend for it. The
+    successor is pointed at the predecessor's path explicitly instead.
     """
     os.environ.update(
         AGENTDO_SOCK=os.path.join(sock_dir, "s.sock"),
@@ -49,12 +58,30 @@ def load_broker(sock_dir, deny_path=None):
         AGENTDO_LOG=os.path.join(sock_dir, "events.log"),
         AGENTDO_CLIENT_UID=str(os.getuid()),
         AGENTDO_DENY=deny_path or os.path.join(sock_dir, "no-such-denylist.json"),
+        AGENTDO_HANDOFF=os.path.join(sock_dir, "h%d.sock" % next(_handoff_seq)),
     )
     name = "agentdo_broker_%s" % uuid.uuid4().hex
     spec = importlib.util.spec_from_file_location(name, BROKER_SRC)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
+    # The handoff socket requires a root peer, like the registration socket.
+    # These tests run as you, so accept this UID instead -- the same concession
+    # register_pid makes by writing broker state directly. The gate itself is
+    # unchanged; only who may ask for a handoff is relaxed, and only here.
+    mod.HANDOFF_PEER_UID = os.getuid()
+    mod.REG_PEER_UID = os.getuid()
+    # The broker exits the process when its last client goes away -- correct
+    # for a real daemon, fatal for a test runner that hosts many brokers and
+    # kills their client shells in tearDown. Stop listening instead, which is
+    # the observable part; tests that care about shutdown assert on state and
+    # the event log rather than on the process dying.
+    mod._shutdown = mod.stop_listening
+    # Same for retirement after a handoff: a real broker exits the process,
+    # which would take the test runner with it. Stopping its listeners is the
+    # in-process equivalent, and _handed_over -- set before _retire is called
+    # -- remains the flag tests assert on.
+    mod._retire = mod.stop_listening
     return mod
 
 
@@ -117,10 +144,40 @@ class Broker:
         self.sock = os.path.join(self.dir, "s.sock")
         self._shell = None
         self._extra = []
+        # Every broker module this instance has run, including retired
+        # predecessors. close() must stop them ALL: self.mod moves on to the
+        # successor after a handoff, and a predecessor left accepting would
+        # still be serving during later tests in this same process.
+        self._mods = [self.mod]
 
-        for target in (self.mod.registration_server, self.mod.command_server):
+        for target in (self.mod.handoff_server, self.mod.registration_server,
+                       self.mod.command_server):
             threading.Thread(target=target, daemon=True).start()
         self._await_socket()
+
+    def start_successor(self):
+        """Start a second broker in this directory, as an upgrade would.
+
+        It adopts from this broker over the handoff socket, then binds the same
+        socket paths -- the real upgrade sequence, minus the process boundary.
+        Returns the successor's module; the predecessor is retired afterwards.
+        """
+        # load_broker already redirects _retire to stop_listening, so the
+        # predecessor stops accepting instead of exiting this process.
+        old = self.mod
+        predecessor_handoff = old.HANDOFF_PATH
+        mod = load_broker(self.dir)
+        adopted = mod.adopt_from_predecessor(predecessor_handoff)
+        old.stop_listening()    # in case the handoff bailed before retiring
+        for target in (mod.handoff_server, mod.registration_server,
+                       mod.command_server):
+            threading.Thread(target=target, daemon=True).start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not os.path.exists(self.sock):
+            time.sleep(0.02)
+        self.mod = mod          # later helpers should talk to the live broker
+        self._mods.append(mod)
+        return mod, adopted
 
     def _await_socket(self, timeout=5.0):
         deadline = time.time() + timeout
@@ -202,6 +259,19 @@ class Broker:
                 return c.pidfd
         raise RuntimeError("pid %d is not registered" % pid)
 
+    def handoff_socket(self, timeout=5.0):
+        """Connect to this broker's handoff socket as a raw client.
+
+        Lets a test play the successor's side of the protocol by hand, which is
+        the only way to reach the failure branches: a real successor always
+        behaves correctly, so refusals and abandoned transfers need a peer that
+        misbehaves on purpose.
+        """
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(self.mod.HANDOFF_PATH)
+        return s
+
     def events(self):
         """Parsed append-only log records the broker has written so far."""
         path = os.path.join(self.dir, "events.log")
@@ -211,6 +281,13 @@ class Broker:
             return [json.loads(line) for line in f if line.strip()]
 
     def close(self):
+        # Stop the accept loops first: these brokers share one process, so a
+        # leaked listener would still be serving during later tests.
+        for mod in self._mods:
+            try:
+                mod.stop_listening()
+            except Exception:
+                pass
         for shell in ([self._shell] if self._shell else []) + self._extra:
             try:
                 shell.close()

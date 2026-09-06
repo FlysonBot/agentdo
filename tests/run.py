@@ -3,7 +3,8 @@
 
     python3 tests/run.py            # everything
     python3 tests/run.py gate       # one module
-                                    # (gate | protocol | signals | launcher)
+                                    # (gate | protocol | signals |
+                                    #  launcher | handoff)
 
 Runs entirely as your own user: the broker's root check lives in main(), and
 these tests drive the servers directly, so commands execute with your
@@ -18,7 +19,8 @@ import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODULES = ("test_gate", "test_protocol", "test_signals", "test_launcher")
+MODULES = ("test_gate", "test_protocol", "test_signals", "test_launcher",
+           "test_handoff")
 
 
 def main():
