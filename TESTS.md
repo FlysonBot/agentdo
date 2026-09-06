@@ -1,8 +1,8 @@
 # Tests
 
 ```bash
-python3 tests/run.py                    # all 50
-python3 tests/run.py gate               # gate | protocol | signals | launcher
+python3 tests/run.py                    # all 73
+python3 tests/run.py gate               # gate | protocol | signals | launcher | handoff
 ```
 
 No dependencies, no `sudo`, no password prompt. Each test starts its own broker
@@ -34,6 +34,24 @@ docstring which failure it defends against.
 **Not covered:** the root-only paths (log writes, socket ownership), which need
 a privileged install to exercise.
 
+## Installing and upgrading
+
+`install.sh` and `agentrun --upgrade` cannot be reached by the suite above:
+both need real root and a real process boundary, and the in-process harness
+stubs the exit paths a genuine handoff depends on.
+
+```bash
+tests/sandbox-install.sh          # add --keep to leave it running
+```
+
+It installs from the working tree — not GitHub, so an unpushed branch is
+testable — into a throwaway prefix under `/tmp`, starts a broker with a
+registered client, upgrades over it, and checks that the registry *moved*
+rather than being rebuilt: the new broker must still name the original client
+as an authorized root. Every path is redirected and broker discovery matches on
+`/proc/<pid>/cmdline`, so it cannot see or disturb an installed broker you are
+using. It does need `sudo`, since the broker must be root.
+
 ## How the suite runs unprivileged
 
 The broker refuses to start as a non-root process, but that check lives in
@@ -60,5 +78,7 @@ launch a client and check:
 2. `agentdo useradd -m test` → denylist error, exit 126, logs `deny`
 3. `echo hi | agentdo cat` → prints `hi`
 4. `agentdo top` → runs interactively; `Ctrl-C` and resizing work
-5. Exit the client → broker stops, socket disappears
+5. Exit the client → broker stops, socket disappears (only once its *last*
+   client is gone: with a second `agentrun` running, the first exiting must
+   leave that one working)
 6. `agentdo echo x` from an unrelated shell → refused
