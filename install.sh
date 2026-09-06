@@ -109,6 +109,9 @@ broker_pids() {
     comm="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 2p)"
     [[ "$comm" == "$INSTALL_DIR/agentdo-broker.py" ]] && printf '%s\n' "$pid"
   done
+  # Explicit success: the loop's last `[[ ]] && printf` would otherwise be the
+  # function's exit status, and finding no broker is a normal outcome.
+  return 0
 }
 
 if [[ -n "$(broker_pids)" ]]; then
