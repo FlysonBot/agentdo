@@ -17,7 +17,9 @@ one command at a time, gone the moment it exits.</h3>
 ## The problem
 
 You're debugging a service with Claude Code. It asks for `sudo journalctl -u nginx`.
+
 You run it. You paste the output back. It asks for `sudo systemctl status nginx`.
+
 You run it. You paste the output back. There's always one more command to run.
 
 **You spend an hour relaying commands the agent could have run itself in five minutes.**
@@ -112,8 +114,13 @@ sudo install -m 0755 agentrun          /usr/local/bin/agentrun
 sudo install -m 0644 denylist.example.json /etc/agentdo/denylist.json
 ```
 
-Re-running those same `install` commands on a newer checkout is also how you
-upgrade — see [Upgrading](#upgrading).
+Prefer a one-liner? Run this instead:
+```bash
+curl -fsSL https://raw.githubusercontent.com/FlysonBot/agentdo/main/install.sh | bash
+```
+
+Either way, re-running it on a newer version is also how you upgrade — see
+[Upgrading](#upgrading).
 
 To uninstall, remove what that put in place:
 
@@ -123,34 +130,7 @@ sudo rm -rf /opt/agentdo /etc/agentdo
 sudo rm -f  /usr/local/bin/agentrun /var/log/agentdo*.log /run/agentdo*.sock
 ```
 
-### Scripted
-
-`install.sh` does the same thing in one command, and checks the platform,
-Python and kernel versions before it starts.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/FlysonBot/agentdo/main/install.sh | bash
-```
-
-**The same command upgrades you.** Re-run it whenever you want the current
-version; it replaces the installed files and takes care of the running broker
-for you — see [Upgrading](#upgrading) for what it does with your running agents.
-
-> [!NOTE]
-> Piping a script into a shell runs code you haven't read, from a host you're
-> trusting, as a script that will ask for `sudo`. That is the trade you are
-> making, and this project blocks `curl | sh` in its own deny list for exactly
-> that reason. To read it first, download it, read it, then run it:
->
-> ```bash
-> curl -fsSLO https://raw.githubusercontent.com/FlysonBot/agentdo/main/install.sh
-> less install.sh
-> bash install.sh
-> ```
-
-`uninstall.sh` reverses it, keeping your deny list and logs unless you pass
-`--purge`:
-
+One-liner to uninstall (pass --purge if you want deny list and logs removed as well):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FlysonBot/agentdo/main/uninstall.sh | bash
 ```
@@ -181,24 +161,10 @@ Run the install command again — the same one you used to install:
 curl -fsSL https://raw.githubusercontent.com/FlysonBot/agentdo/main/install.sh | bash
 ```
 
-A running broker keeps its old code in memory, so the new version has to take
-over from it. It does that by **handing over**: the outgoing broker passes each
-authorization to its successor as a live kernel handle, then retires. Agents
-that are mid-task keep working and never notice.
+If a broker is still running, it hands its clients over to the new version and
+retires — agents mid-task keep working and never notice.
 
-> [!WARNING]
-> **Don't kill the broker to upgrade it.** A client is registered only at
-> launch, so killing the broker strips privilege from every running agent
-> *permanently* — they keep running, but every `agentdo` call fails until the
-> agent itself is restarted. The installer never does this.
-
-**Coming from a version without the handoff?** That broker can't transfer its
-clients — the code to do it isn't in the running process. The installer detects
-this, leaves it alone, and says so. Your agents are unaffected and keep working
-on the old code; the new broker takes over once they exit. Every upgrade after
-that one is seamless.
-
-After a manual install, start the new broker yourself and let it adopt:
+To do so after manual upgrading (meaning you didn't run the one-liner above), run:
 
 ```bash
 sudo env AGENTDO_CLIENT_UID="$(id -u)" \
