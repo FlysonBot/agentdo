@@ -43,11 +43,28 @@ SHIM_DIR="${AGENTDO_SHIM_DIR:-$INSTALL_DIR/bin}"
 
 AGENTDO_SOCK="${AGENTDO_SOCK:-/run/agentdo.sock}"
 AGENTDO_REG="${AGENTDO_REG:-/run/agentdo-reg.sock}"
+# Where a broker offers its registry to a successor. Must be passed through to
+# the broker we start: `sudo env FOO=bar` forwards ONLY what it lists, so a
+# broker started without this falls back to the built-in default and would look
+# for its predecessor on a path nobody is listening on.
+AGENTDO_HANDOFF="${AGENTDO_HANDOFF:-/run/agentdo-handoff.sock}"
 AGENTDO_BOOT_LOG="${AGENTDO_BOOT_LOG:-/var/log/agentdo.boot.log}"
 BROKER_PY="$INSTALL_DIR/agentdo-broker.py"
 
-if [[ $# -lt 1 ]]; then
+UPGRADE=""
+if [[ "${1:-}" == "--upgrade" ]]; then
+  UPGRADE=1
+  shift
+fi
+
+if [[ -z "$UPGRADE" && $# -lt 1 ]]; then
   echo "usage: agentrun <command> [args...]" >&2
+  echo "       agentrun --upgrade        hand a running broker to the new version" >&2
+  exit 2
+fi
+
+if [[ -n "$UPGRADE" && $# -gt 0 ]]; then
+  echo "agentrun: --upgrade takes no command." >&2
   exit 2
 fi
 
@@ -57,6 +74,76 @@ if [[ "$MY_UID" == "0" ]]; then
   echo "agentrun: run this as your NORMAL user, not root." >&2
   echo "It will invoke sudo itself where it needs to." >&2
   exit 1
+fi
+
+# Broker PIDs, ignoring processes that merely MENTION the broker path in their
+# arguments -- `pgrep -f <pattern>` matches those too, including the pgrep in a
+# command substitution here. Compare argv[1] from /proc instead.
+broker_pids() {
+  local pid arg1
+  for pid in $(pgrep -x python3 2>/dev/null); do
+    arg1="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 2p)"
+    [[ "$arg1" == "$BROKER_PY" ]] && printf '%s\n' "$pid"
+  done
+  # Explicit success: the loop's last `[[ ]] && printf` is the function's exit
+  # status, so a final non-matching pid would return 1 and `set -e` would kill
+  # the script -- finding no broker is a normal outcome, not a failure.
+  return 0
+}
+
+# 0. --upgrade: hand a running broker over to the newly installed code. ----- #
+#
+#    Replacing the files on disk does nothing to the broker already running --
+#    it holds its old code in memory. Starting a second broker is what triggers
+#    the handoff: the new one adopts the registry over the handoff socket and
+#    the old one retires once the transfer is confirmed, so agents mid-task
+#    keep their privilege. This is the same launch as below, minus the "only if
+#    no socket" guard, which is exactly why `agentrun <cmd>` cannot do it.
+if [[ -n "$UPGRADE" ]]; then
+  OLD_PIDS="$(broker_pids | sort -n | tr '\n' ' ')"
+  if [[ -z "$OLD_PIDS" ]]; then
+    echo "[agentdo] no broker running; nothing to upgrade." >&2
+    echo "[agentdo] the next 'agentrun <cmd>' starts the new version." >&2
+    exit 0
+  fi
+
+  echo "[agentdo] handing the running broker over to the new version..." >&2
+  if ! sudo -v; then
+    echo "[agentdo] sudo authentication failed; the old broker is untouched." >&2
+    exit 1
+  fi
+
+  sudo env \
+      AGENTDO_SOCK="$AGENTDO_SOCK" \
+      AGENTDO_REG="$AGENTDO_REG" \
+      AGENTDO_HANDOFF="$AGENTDO_HANDOFF" \
+      AGENTDO_CLIENT_UID="$MY_UID" \
+      AGENTDO_BOOT_LOG="$AGENTDO_BOOT_LOG" \
+      setsid sh -c 'exec python3 "$0" >>"$AGENTDO_BOOT_LOG" 2>&1' "$BROKER_PY" &
+
+  # The predecessor exits only after it has confirmed the transfer, so "every
+  # PID we started with is gone" is what distinguishes a completed handoff from
+  # one that merely started.
+  for _ in $(seq 1 50); do
+    sleep 0.1
+    STILL_OLD=""
+    for p in $OLD_PIDS; do
+      kill -0 "$p" 2>/dev/null && STILL_OLD=1
+    done
+    [[ -z "$STILL_OLD" && -S "$AGENTDO_SOCK" ]] && break
+  done
+
+  if [[ -n "$STILL_OLD" ]]; then
+    echo "[agentdo] the old broker did not retire; it is still serving its" >&2
+    echo "[agentdo] clients. They are unaffected -- see $AGENTDO_BOOT_LOG." >&2
+    exit 1
+  fi
+  if [[ ! -S "$AGENTDO_SOCK" || -z "$(broker_pids)" ]]; then
+    echo "[agentdo] the new broker did not come up; see $AGENTDO_BOOT_LOG" >&2
+    exit 1
+  fi
+  echo "[agentdo] upgrade complete; running agents kept their authorization." >&2
+  exit 0
 fi
 
 # 1. Start the broker if its socket isn't there. -------------------------- #
@@ -83,6 +170,7 @@ if [[ ! -S "$AGENTDO_SOCK" ]]; then
   sudo env \
       AGENTDO_SOCK="$AGENTDO_SOCK" \
       AGENTDO_REG="$AGENTDO_REG" \
+      AGENTDO_HANDOFF="$AGENTDO_HANDOFF" \
       AGENTDO_CLIENT_UID="$MY_UID" \
       AGENTDO_BOOT_LOG="$AGENTDO_BOOT_LOG" \
       setsid sh -c 'exec python3 "$0" >>"$AGENTDO_BOOT_LOG" 2>&1' "$BROKER_PY" &
