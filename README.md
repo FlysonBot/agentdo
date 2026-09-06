@@ -162,14 +162,13 @@ curl -fsSL https://raw.githubusercontent.com/FlysonBot/agentdo/main/install.sh |
 ```
 
 If a broker is still running, it hands its clients over to the new version and
-retires — agents mid-task keep working and never notice.
+retires — agents mid-task keep working and never notice. The handover happens
+automatically if you upgrade via the install script.
 
-To do so after manual upgrading (meaning you didn't run the one-liner above), run:
 
+If you upgraded manually by replacing files, you may trigger the handover by running:
 ```bash
-sudo env AGENTDO_CLIENT_UID="$(id -u)" \
-  setsid sh -c 'exec python3 /opt/agentdo/agentdo-broker.py \
-                >>/var/log/agentdo.boot.log 2>&1' &
+agentrun --upgrade
 ```
 
 ---
