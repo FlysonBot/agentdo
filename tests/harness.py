@@ -35,6 +35,7 @@ BROKER_SRC = os.path.join(REPO, "agentdo-broker.py")
 CLIENT = os.path.join(REPO, "bin", "agentdo")
 
 
+
 def load_broker(sock_dir, deny_path=None):
     """Import agentdo-broker.py as a module with test paths in the environment.
 
@@ -57,6 +58,55 @@ def load_broker(sock_dir, deny_path=None):
     return mod
 
 
+class _Shell:
+    """A helper shell that reads commands from a FIFO and echoes a sentinel.
+
+    Used as the root of a registered process tree. The sentinel after each
+    command is how run() knows where one command's output ends.
+    """
+
+    def __init__(self, dir_, sock, index):
+        self.sock = sock
+        fifo_in = os.path.join(dir_, "cmds%d" % index)
+        fifo_out = os.path.join(dir_, "out%d" % index)
+        os.mkfifo(fifo_in)
+        os.mkfifo(fifo_out)
+        self.proc = subprocess.Popen(
+            ["bash", "-c",
+             'while IFS= read -r line; do eval "$line"; echo "__DONE__$?"; done '
+             '< %s > %s 2>&1' % (fifo_in, fifo_out)])
+        self._w = open(fifo_in, "w")
+        self._r = open(fifo_out, "r")
+
+    @property
+    def pid(self):
+        return self.proc.pid
+
+    def run(self, shell_cmd, timeout=30):
+        """Run a shell snippet in this shell; return (output, exit_code)."""
+        self._w.write("export AGENTDO_SOCK=%s; %s\n" % (self.sock, shell_cmd))
+        self._w.flush()
+        lines, deadline = [], time.time() + timeout
+        while time.time() < deadline:
+            line = self._r.readline()
+            if not line:
+                time.sleep(0.01)
+                continue
+            if line.startswith("__DONE__"):
+                return "".join(lines).rstrip("\n"), int(line[8:].strip() or 0)
+            lines.append(line)
+        raise AssertionError("timed out running: %s" % shell_cmd)
+
+    def close(self):
+        for stream in (self._w, self._r):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        self.proc.kill()
+        self.proc.wait(timeout=5)
+
+
 class Broker:
     """A running broker plus a registered client shell to run commands in."""
 
@@ -66,6 +116,7 @@ class Broker:
         self.mod = load_broker(self.dir, deny_path)
         self.sock = os.path.join(self.dir, "s.sock")
         self._shell = None
+        self._extra = []
 
         for target in (self.mod.registration_server, self.mod.command_server):
             threading.Thread(target=target, daemon=True).start()
@@ -89,34 +140,31 @@ class Broker:
         gate being tested reads this same state, so the tests still exercise
         the real authorization path.
         """
-        fifo_in = os.path.join(self.dir, "cmds")
-        fifo_out = os.path.join(self.dir, "out")
-        os.mkfifo(fifo_in)
-        os.mkfifo(fifo_out)
-        # A shell that reads commands forever and echoes a sentinel after each,
-        # so run_in_tree can tell where one command's output ends.
-        self._shell = subprocess.Popen(
-            ["bash", "-c",
-             'while IFS= read -r line; do eval "$line"; echo "__DONE__$?"; done '
-             '< %s > %s 2>&1' % (fifo_in, fifo_out)])
-        self._w = open(fifo_in, "w")
-        self._r = open(fifo_out, "r")
+        self._shell = _Shell(self.dir, self.sock, 0)
         self.register_pid(self._shell.pid)
         return self._shell.pid
 
     def register_pid(self, pid):
-        """Authorize `pid` (and its descendants) the way registration would."""
+        """Authorize `pid` (and its descendants) the way registration would.
+
+        Additive, like the real registration socket: authorizing a second pid
+        leaves the first one authorized.
+        """
         fd = self.mod.pidfd_open(pid)
-        with self.mod.state.lock:
-            old = self.mod.state.authorized_pidfd
-            if old is not None:
-                try:
-                    os.close(old)
-                except OSError:
-                    pass
-            self.mod.state.authorized_pid = pid
-            self.mod.state.authorized_pidfd = fd
-            self.mod.state.proc_start = self.mod._read_starttime(pid)
+        self.mod.state.add(
+            self.mod.Client(pid, fd, self.mod._read_starttime(pid)))
+
+    def register_second_shell(self):
+        """Start and register an ADDITIONAL client shell.
+
+        Returns a Shell handle with its own run()/close(), so a test can drive
+        two concurrently-registered clients and check they do not evict each
+        other. The primary shell from register_shell() is unaffected.
+        """
+        shell = _Shell(self.dir, self.sock, len(self._extra) + 1)
+        self._extra.append(shell)
+        self.register_pid(shell.pid)
+        return shell
 
     # -- running commands -------------------------------------------------- #
 
@@ -128,18 +176,7 @@ class Broker:
         """
         if self._shell is None:
             raise RuntimeError("call register_shell() first")
-        self._w.write("export AGENTDO_SOCK=%s; %s\n" % (self.sock, shell_cmd))
-        self._w.flush()
-        lines, deadline = [], time.time() + timeout
-        while time.time() < deadline:
-            line = self._r.readline()
-            if not line:
-                time.sleep(0.01)
-                continue
-            if line.startswith("__DONE__"):
-                return "".join(lines).rstrip("\n"), int(line[8:].strip() or 0)
-            lines.append(line)
-        raise AssertionError("timed out running: %s" % shell_cmd)
+        return self._shell.run(shell_cmd, timeout=timeout)
 
     def run_outside_tree(self, *argv, timeout=30):
         """Run the client from the TEST process, which is outside the tree."""
@@ -153,6 +190,18 @@ class Broker:
 
     # -- introspection ------------------------------------------------------ #
 
+    def registered_pidfd(self, pid):
+        """The pidfd the broker actually holds for `pid`.
+
+        _watch_exit matches on the registered fd, not just the PID, so a test
+        driving it must pass this rather than opening a fresh pidfd -- a new fd
+        for the same process is a different fd and correctly will not match.
+        """
+        for c in self.mod.state.snapshot():
+            if c.pid == pid:
+                return c.pidfd
+        raise RuntimeError("pid %d is not registered" % pid)
+
     def events(self):
         """Parsed append-only log records the broker has written so far."""
         path = os.path.join(self.dir, "events.log")
@@ -162,12 +211,9 @@ class Broker:
             return [json.loads(line) for line in f if line.strip()]
 
     def close(self):
-        for stream in ("_w", "_r"):
+        for shell in ([self._shell] if self._shell else []) + self._extra:
             try:
-                getattr(self, stream).close()
-            except (AttributeError, OSError):
+                shell.close()
+            except OSError:
                 pass
-        if self._shell is not None:
-            self._shell.kill()
-            self._shell.wait(timeout=5)
         shutil.rmtree(self.dir, ignore_errors=True)

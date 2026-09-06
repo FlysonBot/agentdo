@@ -166,5 +166,79 @@ class GateOverSocketTest(unittest.TestCase):
         self.assertIn("reject", kinds)
 
 
+class ConcurrentClientsTest(unittest.TestCase):
+    """Several clients registered at once, each independently authorized.
+
+    The reported bug: `agentrun claude` in one terminal, then `agentrun claude`
+    in another, and the FIRST one lost agentdo mid-task. The broker kept a
+    single authorization slot, so the second registration overwrote the first,
+    and separately, the first client to exit shut the whole broker down. There
+    is no limit on how many clients may be registered concurrently.
+    """
+
+    def setUp(self):
+        self.b = Broker()
+        self.b.register_shell()
+
+    def tearDown(self):
+        self.b.close()
+
+    def test_second_registration_does_not_evict_the_first(self):
+        """The core regression: registering client #2 must leave #1 working."""
+        second = self.b.register_second_shell()
+        out, code = self.b.run_in_tree(self.b.agentdo("echo first-still-works"))
+        self.assertEqual(out, "first-still-works")
+        self.assertEqual(code, 0)
+        # And the newcomer works too -- this is not a first-wins swap.
+        out2, code2 = second.run(self.b.agentdo("echo second-works"))
+        self.assertEqual(out2, "second-works")
+        self.assertEqual(code2, 0)
+
+    def test_many_clients_are_authorized_at_once(self):
+        """No cap: several concurrent clients all keep working."""
+        shells = [self.b.register_second_shell() for _ in range(4)]
+        out, code = self.b.run_in_tree(self.b.agentdo("echo original"))
+        self.assertEqual((out, code), ("original", 0))
+        for i, sh in enumerate(shells):
+            out, code = sh.run(self.b.agentdo("echo client%d" % i))
+            self.assertEqual((out, code), ("client%d" % i, 0))
+
+    def test_one_client_exiting_leaves_the_others_authorized(self):
+        """The second half of the bug: the first exit killed the broker.
+
+        Privilege must die with the client it was granted to, and with no
+        other.
+        """
+        second = self.b.register_second_shell()
+        pidfd = self.b.registered_pidfd(second.pid)
+        second.close()
+        # Drive the real watcher path, which is what used to call _shutdown().
+        self.b.mod._watch_exit(pidfd, second.pid)
+
+        out, code = self.b.run_in_tree(self.b.agentdo("echo survivor"))
+        self.assertEqual(out, "survivor")
+        self.assertEqual(code, 0)
+
+    def test_exited_client_tree_is_no_longer_authorized(self):
+        """Revocation is still real: the exited client's tree loses access."""
+        second = self.b.register_second_shell()
+        pid, pidfd = second.pid, self.b.registered_pidfd(second.pid)
+        second.close()
+        self.b.mod._watch_exit(pidfd, pid)
+
+        roots = [c.pid for c in self.b.mod.state.snapshot()]
+        self.assertNotIn(pid, roots,
+                         "an exited client must be removed from the registry")
+
+    def test_outsider_still_refused_with_several_clients(self):
+        """More registered trees must not weaken the gate."""
+        self.b.register_second_shell()
+        self.b.register_second_shell()
+        r = self.b.run_outside_tree("echo", "malware")
+        self.assertEqual(r.returncode, 127)
+        self.assertIn("not authorized", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
