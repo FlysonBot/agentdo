@@ -72,9 +72,11 @@ mkdir -p "$SBX" "$AGENTDO_BIN_DIR"
 say "1. install from the working tree"
 # install.sh composes BASE from REPO/REF; point it at the checkout instead.
 sed "s|^BASE=.*|BASE=\"file://$REPO_DIR\"|" "$REPO_DIR/install.sh" > "$SBX/install.sh"
-bash "$SBX/install.sh"
+bash "$SBX/install.sh" --sudo-shim
 
 [[ -x "$AGENTDO_BIN_DIR/agentrun" ]] || { echo "FAIL: agentrun not installed"; exit 1; }
+[[ "$(readlink "$AGENTDO_INSTALL_DIR/bin/sudo")" == "agentdo" ]] \
+  || { echo "FAIL: --sudo-shim did not create the sudo -> agentdo symlink"; exit 1; }
 note "installed: $(ls "$AGENTDO_INSTALL_DIR" "$AGENTDO_BIN_DIR" | tr '\n' ' ')"
 
 # ---------------------------------------------------------------------------
@@ -132,6 +134,14 @@ elif [[ "$out" == *"no authorized client"* ]]; then
   echo "   FAIL: new broker has an EMPTY registry -- the handoff did not transfer"; fail=1
 else
   note "note: unexpected shim output: $out"
+fi
+
+# The sudo shim is the same file, so it must accept sudo's options too.
+out="$(AGENTDO_SOCK="$AGENTDO_SOCK" "$AGENTDO_INSTALL_DIR/bin/sudo" -n true 2>&1 || true)"
+if [[ "$out" == *"unknown option"* || "$out" == *"command not found"* ]]; then
+  echo "   FAIL: sudo shim rejected -n: $out"; fail=1
+else
+  note "OK: sudo shim accepts sudo options"
 fi
 
 if sudo grep -q '"kind": "handoff_out"' "$AGENTDO_LOG" 2>/dev/null; then

@@ -1,7 +1,7 @@
 # Tests
 
 ```bash
-python3 tests/run.py                    # all 73
+python3 tests/run.py                    # all 89
 python3 tests/run.py gate               # gate | protocol | signals | launcher | handoff
 ```
 

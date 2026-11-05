@@ -110,6 +110,9 @@ sudo install -m 0750 agentdo-broker.py /opt/agentdo/agentdo-broker.py
 sudo install -m 0755 bin/agentdo       /opt/agentdo/bin/agentdo
 sudo install -m 0755 agentrun          /usr/local/bin/agentrun
 
+# Optional — a `sudo` shim for agents that type `sudo` out of habit:
+sudo ln -sfn agentdo /opt/agentdo/bin/sudo
+
 # Optional — built-in defaults apply if you skip this:
 sudo install -m 0644 denylist.example.json /etc/agentdo/denylist.json
 ```
@@ -148,10 +151,29 @@ For commands needing root, use `agentdo <cmd>` instead of `sudo <cmd>`.
 ```
 
 > [!TIP]
-> Prefer not to change how your agent phrases commands? Drop a wrapper named
-> `sudo` into `/opt/agentdo/bin`. It shadows the system `sudo` for that agent
-> only. Not the default, since a file named `sudo` on the `PATH` advertises the
-> privilege path.
+> Prefer not to change how your agent phrases commands? Install the optional
+> `sudo` shim: a symlink named `sudo` in `/opt/agentdo/bin` pointing at
+> `agentdo`. It shadows the system `sudo` for that agent only. It is not the
+> default, since a file named `sudo` on the `PATH` advertises the privilege path.
+> `install.sh` asks whether you want it (or pass `--sudo-shim` /
+> `--no-sudo-shim`, or set `AGENTDO_SUDO_SHIM=yes|no`; use
+> `curl ... | bash -s -- --sudo-shim` when piping). By hand:
+> `sudo ln -sfn agentdo /opt/agentdo/bin/sudo`.
+
+### sudo-style options
+
+`agentdo` (and the `sudo` shim, which is the same file) accepts the common
+options of `sudo`, so tools that call `sudo -n ...` keep working:
+
+| Option | Behaviour |
+|---|---|
+| `-n -S -H -k -K -b -B -P -A -p -C -r -t` | Accepted and ignored: the broker never prompts. |
+| `-v` | With no command, succeeds without doing anything. |
+| `-u user` | Runs the command as that user via `runuser`. |
+| `-D dir` | Runs the command in that directory. |
+| `VAR=value cmd` | Runs `env VAR=value cmd`. |
+| `-E` / `--preserve-env` | Prints a warning and runs anyway: the broker forwards only `PATH`, `LANG`, `LC_ALL`, `TERM` and `TZ`. |
+| `-i -s -g -l -e -V` | Refused with a clear message (exit 2). |
 
 ## Upgrading
 

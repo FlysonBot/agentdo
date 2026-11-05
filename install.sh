@@ -12,6 +12,16 @@
 # Downloads the four files agentdo needs into place. Uses sudo for the install
 # steps only; everything else runs as you. Set AGENTDO_REF to install from a
 # branch, tag, or commit other than main.
+#
+# Optionally also installs a `sudo` shim (a symlink to the agentdo shim) for
+# agents that insist on typing `sudo`. It is NOT installed by default: a file
+# named sudo on the agent's PATH advertises the privilege path. You are asked;
+# to answer ahead of time (needed when piping through `curl | bash`, where
+# there may be no terminal to ask on):
+#
+#   bash install.sh --sudo-shim        or  AGENTDO_SUDO_SHIM=yes
+#   bash install.sh --no-sudo-shim     or  AGENTDO_SUDO_SHIM=no
+#   curl -fsSL .../install.sh | bash -s -- --sudo-shim
 
 set -euo pipefail
 
@@ -25,6 +35,17 @@ CONF_DIR="${AGENTDO_CONF_DIR:-/etc/agentdo}"
 
 say()  { printf '[agentdo] %s\n' "$*" >&2; }
 die()  { printf '[agentdo] error: %s\n' "$*" >&2; exit 1; }
+
+# yes | no | ask. Anything else is treated as ask.
+SUDO_SHIM="${AGENTDO_SUDO_SHIM:-ask}"
+for arg in "$@"; do
+  case "$arg" in
+    --sudo-shim)    SUDO_SHIM=yes ;;
+    --no-sudo-shim) SUDO_SHIM=no ;;
+    -h|--help)      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $arg" ;;
+  esac
+done
 
 # ------------------------------- preflight --------------------------------- #
 
@@ -75,6 +96,35 @@ python3 -m py_compile "$TMP/agentdo-broker.py" "$TMP/bin/agentdo" \
   || die "downloaded Python files failed to compile; refusing to install."
 bash -n "$TMP/agentrun" || die "downloaded agentrun is not valid bash; refusing to install."
 
+# ------------------------------ sudo shim? --------------------------------- #
+
+# Decide before installing, so the question comes first and the rest runs
+# unattended. A shim that is already there is kept current rather than asked
+# about again -- a stale copy would silently diverge from agentdo -- unless the
+# user said no.
+if [[ "$SUDO_SHIM" != yes && "$SUDO_SHIM" != no ]]; then
+  if [[ -e "$INSTALL_DIR/bin/sudo" || -L "$INSTALL_DIR/bin/sudo" ]]; then
+    SUDO_SHIM=yes
+    say "found an existing sudo shim; keeping it up to date."
+  # Under `curl | bash` stdin is the script, so ask on the terminal itself.
+  elif { : </dev/tty >/dev/tty; } 2>/dev/null; then
+    {
+      printf '\n'
+      printf 'Also install a `sudo` shim?\n'
+      printf '  Agents that type `sudo ...` will then use agentdo (inside agentrun only)\n'
+      printf '  instead of failing, with no CLAUDE.md instruction needed. The catch: a\n'
+      printf '  file named sudo on the agent'"'"'s PATH advertises the privilege path.\n'
+      printf 'Install it? [y/N] '
+    } >/dev/tty
+    read -r reply </dev/tty || reply=""
+    case "$reply" in [yY]|[yY][eE][sS]) SUDO_SHIM=yes ;; *) SUDO_SHIM=no ;; esac
+  else
+    SUDO_SHIM=no
+    say "no terminal to ask on; not installing the sudo shim"
+    say "(re-run with --sudo-shim or AGENTDO_SUDO_SHIM=yes to add it)."
+  fi
+fi
+
 # -------------------------------- install ---------------------------------- #
 
 say "installing (needs sudo)..."
@@ -82,6 +132,15 @@ sudo mkdir -p "$INSTALL_DIR/bin" "$CONF_DIR"
 sudo install -m 0750 "$TMP/agentdo-broker.py" "$INSTALL_DIR/agentdo-broker.py"
 sudo install -m 0755 "$TMP/bin/agentdo"       "$INSTALL_DIR/bin/agentdo"
 sudo install -m 0755 "$TMP/agentrun"          "$BIN_DIR/agentrun"
+
+# A symlink, not a copy: one file, so the two names cannot drift apart and every
+# upgrade of agentdo upgrades sudo with it. The link is relative and the shim
+# never looks at argv[0], so the name changes nothing about behaviour. -n stops
+# ln following an existing sudo that is itself a link; -f replaces an older
+# regular-file copy.
+if [[ "$SUDO_SHIM" == yes ]]; then
+  sudo ln -sfn agentdo "$INSTALL_DIR/bin/sudo"
+fi
 
 # Never clobber a denylist the user has customised.
 if [[ -e "$CONF_DIR/denylist.json" ]]; then
@@ -189,6 +248,7 @@ fi
 say "installed:"
 say "  $INSTALL_DIR/agentdo-broker.py"
 say "  $INSTALL_DIR/bin/agentdo"
+[[ "$SUDO_SHIM" == yes ]] && say "  $INSTALL_DIR/bin/sudo -> agentdo"
 say "  $BIN_DIR/agentrun"
 say ""
 say "start an agent with:  agentrun claude"

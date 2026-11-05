@@ -2,11 +2,16 @@
 """
 agentdo  --  client shim that forwards a command to the agentdo broker.
 
-Deliberately NOT named `sudo`: it does not shadow the system sudo, and its name
-does not advertise a privilege path to anyone inspecting the environment.
+Deliberately NOT named `sudo` by default: it does not shadow the system sudo,
+and its name does not advertise a privilege path to anyone inspecting the
+environment. install.sh can optionally add a `sudo` symlink to this same file
+for agents that insist on typing `sudo`; the two names behave identically.
 
 Usage:
-    agentdo <command> [args...]
+    agentdo [sudo-style options] <command> [args...]
+
+Common sudo options are accepted so tools that call `sudo -n ...`, `sudo -u
+user ...` or `sudo VAR=value cmd` keep working: see parse_sudo_args().
 
 It connects to the broker's command socket and sends argv (plus cwd and a
 filtered env) together with this process's own stdin, stdout and stderr, passed
@@ -30,6 +35,7 @@ import sys
 import os
 import socket
 import json
+import re
 import signal
 
 SOCK_PATH = os.environ.get("AGENTDO_SOCK", "/run/agentdo.sock")
@@ -50,11 +56,161 @@ RELAY_SIGNALS = (
 # execution more than necessary. Extend deliberately if your workload needs it.
 ENV_FORWARD = ("PATH", "LANG", "LC_ALL", "TERM", "TZ")
 
+
+# --------------------------- sudo-style options ----------------------------- #
+#
+# Anything that calls `sudo` may pass sudo's own options first. The broker
+# always runs commands as root, without prompting, so most of them are no-ops;
+# a few map onto a wrapper command; the rest are refused with a clear message
+# rather than being mistaken for the command to run.
+
+# Accepted and ignored: the broker never prompts or caches credentials.
+_SUDO_IGNORED = frozenset("nSHkKbBPA")
+_SUDO_IGNORED_LONG = frozenset((
+    "--non-interactive", "--stdin", "--set-home", "--reset-timestamp",
+    "--remove-timestamp", "--background", "--askpass"))
+# Take a value we have no use for.
+_SUDO_VALUE_IGNORED = frozenset("pCrt")
+_SUDO_VALUE_IGNORED_LONG = frozenset(
+    ("--prompt", "--close-from", "--role", "--type"))
+# Cannot be honoured through the broker.
+_SUDO_UNSUPPORTED = {
+    "i": "-i/--login", "s": "-s/--shell", "g": "-g/--group",
+    "l": "-l/--list", "e": "-e/--edit", "V": "-V/--version",
+}
+_SUDO_UNSUPPORTED_LONG = {
+    "--login": "-i/--login", "--shell": "-s/--shell", "--group": "-g/--group",
+    "--list": "-l/--list", "--edit": "-e/--edit", "--version": "-V/--version",
+}
+
+
+class _UsageError(Exception):
+    pass
+
+
+def _warn(msg):
+    sys.stderr.write(f"agentdo: warning: {msg}\n")
+
+
+def parse_sudo_args(args):
+    """Turn `[sudo options] [VAR=value ...] command...` into the argv to run.
+
+    Returns the argv, or None when there is nothing to run (`sudo -v`).
+    Raises _UsageError for options we cannot honour.
+    """
+    user = chdir = None
+    validate = False
+    i, n = 0, len(args)
+
+    def value(flag, attached):
+        nonlocal i
+        if attached:
+            return attached
+        i += 1
+        if i >= n:
+            raise _UsageError(f"option '{flag}' requires an argument")
+        return args[i]
+
+    saw_dashdash = False
+    while i < n:
+        a = args[i]
+        if a == "--":
+            i += 1
+            saw_dashdash = True
+            break
+        if not a.startswith("-") or a == "-":
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in _SUDO_IGNORED_LONG:
+                pass
+            elif name in _SUDO_VALUE_IGNORED_LONG:
+                value(name, val)
+            elif name == "--validate":
+                validate = True
+            elif name == "--preserve-env":
+                _warn_preserve_env()
+            elif name == "--user":
+                user = value(name, val)
+            elif name == "--chdir":
+                chdir = value(name, val)
+            elif name in _SUDO_UNSUPPORTED_LONG:
+                raise _UsageError(
+                    f"option '{_SUDO_UNSUPPORTED_LONG[name]}' is not "
+                    "supported by the agentdo broker")
+            else:
+                raise _UsageError(f"unknown option '{name}'")
+            i += 1
+            continue
+        # A cluster of short options, e.g. -nE or -nu user or -nuuser.
+        cluster, j = a[1:], 0
+        while j < len(cluster):
+            c = cluster[j]
+            j += 1
+            if c in _SUDO_IGNORED:
+                continue
+            if c == "v":
+                validate = True
+            elif c == "E":
+                _warn_preserve_env()
+            elif c in _SUDO_VALUE_IGNORED:
+                value("-" + c, cluster[j:])
+                break
+            elif c == "u":
+                user = value("-u", cluster[j:])
+                break
+            elif c == "D":
+                chdir = value("-D", cluster[j:])
+                break
+            elif c in _SUDO_UNSUPPORTED:
+                raise _UsageError(
+                    f"option '{_SUDO_UNSUPPORTED[c]}' is not supported by "
+                    "the agentdo broker")
+            else:
+                raise _UsageError(f"unknown option '-{c}'")
+        i += 1
+
+    # `sudo VAR=value cmd` sets VAR for cmd. Not after `--`: there the next
+    # word is the command, even if it looks like an assignment.
+    envs = []
+    while not saw_dashdash and i < n and _ENV_ASSIGN.match(args[i]):
+        envs.append(args[i])
+        i += 1
+
+    cmd = list(args[i:])
+    if not cmd:
+        if validate:
+            return None
+        raise _UsageError("a command is required")
+    if envs:
+        cmd = ["env", *envs, *cmd]
+    if user not in (None, "root", "0"):
+        cmd = ["runuser", "-u", user, "--", *cmd]
+    if chdir is not None:
+        cmd = ["sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", chdir, *cmd]
+    return cmd
+
+
+_ENV_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _warn_preserve_env():
+    _warn("-E/--preserve-env is not supported: the broker forwards only "
+          + ", ".join(ENV_FORWARD) + "; running anyway without your environment")
+
 def main():
     args = sys.argv[1:]
     if not args:
         sys.stderr.write("agentdo: no command given\n")
         return 2
+
+    try:
+        args = parse_sudo_args(args)
+    except _UsageError as e:
+        sys.stderr.write(f"agentdo: {e}\n")
+        return 2
+    if args is None:  # `sudo -v`: nothing to run
+        return 0
 
     req = {
         "version": PROTOCOL_VERSION,

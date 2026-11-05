@@ -5,6 +5,8 @@ the docstring says which failure the test pins down, because the value of the
 test is knowing what it is defending against.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import socket
@@ -12,7 +14,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Broker
+from harness import Broker, CLIENT
 
 
 class StdioTest(unittest.TestCase):
@@ -196,3 +198,111 @@ class DenylistTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _load_shim():
+    """The client shim is extensionless, so load it by path."""
+    loader = importlib.machinery.SourceFileLoader("agentdo_shim", CLIENT)
+    spec = importlib.util.spec_from_loader("agentdo_shim", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class SudoOptionsTest(unittest.TestCase):
+    """`sudo -n cmd`, `sudo -u user cmd` and `sudo VAR=x cmd` must work.
+
+    Agents reach for those spellings from habit, and the shim used to treat the
+    first word as the command, so `sudo -n true` failed with "command not
+    found: -n" -- indistinguishable, to the agent, from sudo being broken.
+    Parsing is checked directly (the -u branch needs real root to execute);
+    a few cases also run end to end through a broker.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shim = _load_shim()
+
+    def parse(self, *args):
+        return self.shim.parse_sudo_args(list(args))
+
+    def test_plain_command_is_untouched(self):
+        self.assertEqual(self.parse("ls", "-la"), ["ls", "-la"])
+
+    def test_options_after_the_command_belong_to_the_command(self):
+        self.assertEqual(self.parse("ls", "-n", "-u"), ["ls", "-n", "-u"])
+
+    def test_noop_options_are_dropped(self):
+        self.assertEqual(self.parse("-n", "-S", "-H", "-k", "true"), ["true"])
+
+    def test_combined_short_options(self):
+        self.assertEqual(self.parse("-nH", "true"), ["true"])
+        self.assertEqual(self.parse("-nu", "bob", "id"),
+                         ["runuser", "-u", "bob", "--", "id"])
+        self.assertEqual(self.parse("-nubob", "id"),
+                         ["runuser", "-u", "bob", "--", "id"])
+
+    def test_user_option_forms(self):
+        want = ["runuser", "-u", "bob", "--", "id"]
+        for opts in (["-u", "bob"], ["-ubob"], ["--user", "bob"],
+                     ["--user=bob"]):
+            self.assertEqual(self.parse(*opts, "id"), want, opts)
+
+    def test_root_user_needs_no_wrapper(self):
+        self.assertEqual(self.parse("-u", "root", "id"), ["id"])
+
+    def test_chdir(self):
+        argv = self.parse("-D", "/etc", "pwd")
+        self.assertEqual(argv[-2:], ["/etc", "pwd"])
+        self.assertEqual(argv[:2], ["sh", "-c"])
+
+    def test_variable_assignments_become_env(self):
+        self.assertEqual(self.parse("FOO=bar", "cmd"),
+                         ["env", "FOO=bar", "cmd"])
+
+    def test_double_dash_ends_options_and_assignments(self):
+        self.assertEqual(self.parse("--", "-n"), ["-n"])
+        self.assertEqual(self.parse("--", "A=b"), ["A=b"])
+
+    def test_validate_without_a_command_runs_nothing(self):
+        self.assertIsNone(self.parse("-v"))
+        self.assertIsNone(self.parse("-n", "-v"))
+
+    def test_missing_command_is_an_error(self):
+        with self.assertRaises(self.shim._UsageError):
+            self.parse("-n")
+
+    def test_unsupported_and_unknown_options_are_refused(self):
+        for opt in ("-i", "-s", "-l", "-e", "-g", "--login", "-z", "--bogus"):
+            with self.assertRaises(self.shim._UsageError, msg=opt):
+                self.parse(opt, "id")
+
+    def test_missing_option_argument_is_an_error(self):
+        with self.assertRaises(self.shim._UsageError):
+            self.parse("-u")
+
+    def test_preserve_env_warns_but_still_runs(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            argv = self.parse("-E", "id")
+        self.assertEqual(argv, ["id"])
+        self.assertIn("preserve-env is not supported", err.getvalue())
+
+    def test_end_to_end_flags_and_assignments(self):
+        b = Broker()
+        b.register_shell()
+        self.addCleanup(b.close)
+        out, code = b.run_in_tree(b.agentdo("-n true"))
+        self.assertEqual(code, 0, out)
+        out, code = b.run_in_tree(b.agentdo("-nE FOO=bar sh -c 'echo $FOO' 2>/dev/null"))
+        self.assertEqual((out.strip(), code), ("bar", 0))
+
+    def test_end_to_end_refusal_exits_2_with_a_message(self):
+        b = Broker()
+        b.register_shell()
+        self.addCleanup(b.close)
+        out, code = b.run_in_tree("%s 2>&1" % b.agentdo("-i"))
+        self.assertEqual(code, 2)
+        self.assertIn("not supported", out)
