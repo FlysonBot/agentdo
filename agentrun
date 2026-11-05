@@ -177,13 +177,20 @@ if [[ ! -S "$AGENTDO_SOCK" ]]; then
   BROKER_SUDO=$!
 
   # Now the wait is purely about process startup, not about typing speed.
-  for _ in $(seq 1 50); do
+  #
+  # The wrapper sudo does NOT live as long as the broker: setsid forks when its
+  # caller leads a process group (sudo's pty makes it so), so sudo returns
+  # within milliseconds while the detached broker is still importing Python and
+  # has not bound its socket yet (~200ms, longer on a cold cache). A wrapper
+  # that exited 0 therefore says nothing about the broker -- keep polling for
+  # the socket. Only a NON-ZERO exit means the launch itself failed, and that
+  # is worth reporting at once instead of burning the timeout.
+  WRAPPER_DONE=""
+  for _ in $(seq 1 100); do
     [[ -S "$AGENTDO_SOCK" ]] && break
-    # If the sudo wrapper exited without creating the socket, stop waiting out
-    # the full timeout and report it immediately.
-    if ! kill -0 "$BROKER_SUDO" 2>/dev/null; then
-      wait "$BROKER_SUDO" 2>/dev/null || true
-      break
+    if [[ -z "$WRAPPER_DONE" ]] && ! kill -0 "$BROKER_SUDO" 2>/dev/null; then
+      wait "$BROKER_SUDO" 2>/dev/null || break
+      WRAPPER_DONE=1
     fi
     sleep 0.1
   done

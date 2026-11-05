@@ -185,6 +185,28 @@ class LauncherTest(unittest.TestCase):
         self.assertLess(elapsed, 4.0,
                         "waited out the full timeout for a broker already dead")
 
+    def test_wrapper_sudo_returning_early_does_not_abort_startup(self):
+        """The real sudo returns within milliseconds of launching the broker.
+
+        `setsid` forks when its caller leads a process group, which sudo's pty
+        makes true, so the wrapper exits 0 while the detached broker is still
+        importing Python (~200ms on a cold start). The launcher used to treat
+        "wrapper gone, no socket yet" as a dead broker and reported "broker
+        failed to start" -- on every cold start, then worked on the retry
+        because the broker had come up in the meantime. The other tests miss
+        this because their fake sudo `exec`s the broker and so never returns.
+        """
+        self.write_broker_stub(delay=0.6)
+        self.write_sudo("""
+            if [[ "$1" == "-v" ]]; then exit 0; fi
+            "$@" </dev/null &      # detach the broker, then return at once
+            exit 0
+            """)
+        proc, _ = self.run_launcher("true")
+        self.assertIn("broker is up", proc.stderr,
+                      "gave up because the wrapper sudo exited before the "
+                      "broker bound its socket")
+
     def test_existing_socket_skips_broker_startup(self):
         """With a broker already running, the launcher must not sudo at all."""
         sock = os.path.join(self.dir, "s.sock")
